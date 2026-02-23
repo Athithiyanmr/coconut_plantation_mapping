@@ -63,12 +63,11 @@ if not args.skip_download:
 
 
 # 2️⃣ AOI clip
-run(f"python scripts/01_prepare_aoi_raw.py --aoi {AOI}")
+run(f"python scripts/01_prepare_aoi_raw.py --year {YEAR} --aoi {AOI}")
 
 
 # 3️⃣ Build stack
 run("python scripts/02_build_stack.py")
-
 
 # 4️⃣ Training labels
 if CSV:
