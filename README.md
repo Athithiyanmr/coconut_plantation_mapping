@@ -2,9 +2,6 @@
 # 🌍 Chennai Urban Climate
 ## Deep Learning-Based Built-Up Area Extraction Using Sentinel-2
 
-Author: Athithiyan M.R  
-Domain: Remote Sensing · Geospatial AI · Urban Climate Analytics  
-Year: 2026  
 
 ---
 
