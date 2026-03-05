@@ -14,11 +14,11 @@ parser.add_argument("--aoi", required=True)
 args = parser.parse_args()
 
 YEAR = args.year
-AOI_NAME = args.aoi
+AOI = args.aoi
 
-AOI = f"data/raw/boundaries/{AOI_NAME}.shp"
-REF = f"data/processed/stack_{YEAR}_{AOI_NAME}.tif"
-OUT = f"data/raw/training/labels_{YEAR}_{AOI_NAME}.tif"
+AOI = f"data/raw/boundaries/{AOI}.shp"
+REF = f"data/processed/stack_{YEAR}_{AOI}.tif"
+OUT = f"data/raw/training/labels_{YEAR}_{AOI}.tif"
 
 # -------------------------------------------------
 # 1. Load AOI

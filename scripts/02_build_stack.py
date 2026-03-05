@@ -94,7 +94,7 @@ stack[:, mask] = 0
 # ---------------------------------------
 ref_meta.update(count=10, dtype="float32", nodata=0)
 
-out_path = OUT_DIR / f"stack_{YEAR}_{AOI}.tif"
+out_path = OUT_DIR / f"stack_{YEAR}.tif"
 
 with rasterio.open(out_path, "w", **ref_meta) as dst:
     dst.write(stack)
