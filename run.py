@@ -67,7 +67,9 @@ run(f"python scripts/01_prepare_aoi_raw.py --year {YEAR} --aoi {AOI}")
 
 
 # 3️⃣ Build stack
-run("python scripts/02_build_stack.py")
+run(f"python scripts/02_build_stack.py --year {YEAR} --aoi {AOI}")
+
+run('find . -name "._*" -type f -delete')
 
 # 4️⃣ Training labels
 if CSV:
