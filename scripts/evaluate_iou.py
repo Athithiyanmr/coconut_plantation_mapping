@@ -10,16 +10,22 @@ import matplotlib.pyplot as plt
 # ARGUMENTS
 # -------------------------------------------------
 parser = argparse.ArgumentParser()
+
 parser.add_argument("--year", required=True)
 parser.add_argument("--aoi", required=True)
 parser.add_argument("--threshold", type=float, default=None,
                     help="Optional threshold. If not given → auto search")
+
 args = parser.parse_args()
 
 YEAR = args.year
 AOI = args.aoi
 THRESHOLD = args.threshold
 
+
+# -------------------------------------------------
+# PATHS
+# -------------------------------------------------
 PRED = Path(f"outputs/unet/{YEAR}/builtup_prob_{YEAR}_{AOI}.tif")
 LABEL = Path(f"data/raw/training/labels_google_{YEAR}_{AOI}.tif")
 
@@ -36,6 +42,7 @@ print(f"\nEvaluating: {YEAR} | {AOI}")
 # LOAD PREDICTION
 # -------------------------------------------------
 with rasterio.open(PRED) as src:
+
     pred = src.read(1)
     meta = src.meta
     H, W = pred.shape
@@ -68,10 +75,11 @@ if THRESHOLD is None:
 
     print("\nSearching best threshold...")
 
-    thresholds = np.arange(0.2, 0.7, 0.05)
+    thresholds = np.arange(0.5, 0.9, 0.05)
 
     best_iou = 0
     best_t = 0.5
+    iou_scores = []
 
     for t in thresholds:
 
@@ -84,12 +92,26 @@ if THRESHOLD is None:
 
         print(f"Threshold {t:.2f} → IoU {iou:.4f}")
 
+        iou_scores.append(iou)
+
         if iou > best_iou:
             best_iou = iou
             best_t = t
 
     THRESHOLD = best_t
+
     print(f"\nBest threshold selected: {THRESHOLD:.2f}")
+
+    # -------------------------------------------------
+    # IoU vs Threshold Plot
+    # -------------------------------------------------
+    plt.figure()
+    plt.plot(thresholds, iou_scores, marker="o")
+    plt.xlabel("Threshold")
+    plt.ylabel("IoU")
+    plt.title("IoU vs Threshold")
+    plt.grid()
+    plt.show()
 
 
 # -------------------------------------------------
@@ -144,6 +166,7 @@ print("✅ Confusion raster saved:", conf_path)
 # -------------------------------------------------
 # PROBABILITY HISTOGRAM
 # -------------------------------------------------
+plt.figure()
 plt.hist(pred.flatten(), bins=50)
 plt.title("Prediction Probability Histogram")
 plt.xlabel("Probability")
