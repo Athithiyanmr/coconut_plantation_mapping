@@ -78,7 +78,7 @@ mask = (b2 == nodata) if nodata is not None else np.zeros_like(b2, dtype=bool)
 # ---------------------------------------
 ndvi = (b8 - b4) / (b8 + b4 + 1e-6)
 ndbi = (b11 - b8) / (b11 + b8 + 1e-6)
-ndwi = (b3 - b8) / (b3 + b8 + 1e-6)
+ndwi = (b3 - b8) / (b3 + b8 + 1e-6)  # ndwi = (b3 - b11) / (b3 + b11 + 1e-6) this is mndwi 
 bsi  = ((b11 + b4) - (b8 + b2)) / ((b11 + b4) + (b8 + b2) + 1e-6)
 ibi  = (ndbi - (ndvi + ndwi)/2) / (ndbi + (ndvi + ndwi)/2 + 1e-6)
 

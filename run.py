@@ -65,7 +65,7 @@ if not args.skip_download:
 # 2️⃣ AOI clip
 run(f"python scripts/01_prepare_aoi_raw.py --year {YEAR} --aoi {AOI}")
 
-
+run('find . -name "._*" -type f -delete')
 # 3️⃣ Build stack
 run(f"python scripts/02_build_stack.py --year {YEAR} --aoi {AOI}")
 
@@ -107,7 +107,7 @@ run(
 
 
 # 8️⃣ Evaluate (⭐ VERY IMPORTANT)
-run(f"python scripts/evaluate_unet.py --year {YEAR} --aoi {AOI}")
+run(f"python scripts/evaluate_iou.py --year {YEAR} --aoi {AOI}")
 
 
 print("\n🎉 FULL PIPELINE COMPLETE")
