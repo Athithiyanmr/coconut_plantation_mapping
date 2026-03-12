@@ -1,214 +1,214 @@
+# 🏙️ Chennai Urban Climate
 
-# 🌍 Chennai Urban Climate
-## Deep Learning-Based Built-Up Area Extraction Using Sentinel-2
+> **A deep learning pipeline for built-up area extraction from Sentinel-2 imagery using UNet semantic segmentation — applied to Chennai for urban climate analysis.**
 
-
----
-
-# 1️⃣ Project Overview
-
-Urban expansion significantly alters land surface properties, influencing:
-
-- Urban Heat Island intensity  
-- Flood vulnerability  
-- Surface runoff dynamics  
-- Carbon balance  
-- Climate resilience planning  
-
-Accurate and scalable mapping of built-up areas is therefore critical for climate-informed urban decision-making.
-
-This project develops a reproducible deep learning pipeline to extract built-up (urban) areas from Sentinel-2 satellite imagery using a multi-spectral UNet segmentation framework.
-
-The system integrates:
-
-- Automated satellite acquisition  
-- Multi-tile AOI handling  
-- Spectral feature engineering  
-- Supervised semantic segmentation  
-- Quantitative performance evaluation  
+[![Python](https://img.shields.io/badge/Python-3776AB?style=flat-square&logo=python&logoColor=white)](https://python.org)
+[![Sentinel-2](https://img.shields.io/badge/Sentinel--2-003DA5?style=flat-square)](https://sentinel.esa.int)
+[![Deep Learning](https://img.shields.io/badge/UNet-Deep%20Learning-FF4500?style=flat-square)](https://arxiv.org/abs/1505.04597)
+[![Planetary Computer](https://img.shields.io/badge/Microsoft%20Planetary%20Computer-0078D4?style=flat-square&logo=microsoft&logoColor=white)](https://planetarycomputer.microsoft.com)
+[![MIT License](https://img.shields.io/badge/License-MIT-green?style=flat-square)](LICENSE)
 
 ---
 
-# 2️⃣ Scientific Objective
+## 📌 What Is This?
 
-The core objective is:
+Urban expansion reshapes land surfaces in ways that directly drive climate risk — intensifying heat islands, increasing flood vulnerability, and altering carbon balance. Mapping built-up areas accurately and at scale is foundational to climate-informed urban planning.
 
-> To learn pixel-level representations of built-up surfaces using multi-spectral Sentinel-2 imagery enhanced with urban-discriminative spectral indices.
+This project builds a **reproducible deep learning pipeline** that extracts built-up areas from Sentinel-2 satellite imagery using a **multi-spectral UNet segmentation model** — trained on Chennai and applicable to any Indian city.
 
-Instead of relying on traditional classification methods, this project applies deep convolutional neural networks to perform semantic segmentation at 10m resolution.
-
----
-
-# 3️⃣ Data Foundation
-
-## Sentinel-2 Level-2A
-
-Spatial Resolution:
-- 10 m (Visible + NIR)
-- 20 m (SWIR, resampled)
-
-Spectral Bands Used:
-
-- B02 – Blue  
-- B03 – Green  
-- B04 – Red  
-- B08 – Near Infrared  
-- B11 – Shortwave Infrared  
-
-Scenes are automatically selected using:
-
-- Lowest cloud cover per year  
-- Tile-aware search for large AOIs  
-- STAC API integration via Microsoft Planetary Computer  
+It goes beyond traditional ML classifiers by applying convolutional neural networks to learn spatial patterns directly from satellite image patches, achieving pixel-level segmentation at 10m resolution.
 
 ---
 
-# 4️⃣ Feature Engineering
+## 🎯 Scientific Objective
 
-To improve urban separability, spectral indices are computed:
-
-- NDVI — Vegetation contrast  
-- NDBI — Built-up indicator  
-- NDWI — Water detection  
-- BSI — Bare soil detection  
-- IBI — Integrated built-up index  
-
-Final model input:
-
-[B02, B03, B04, B08, B11, NDVI, NDBI, NDWI, BSI, IBI]
-
-This transforms raw satellite imagery into an urban-aware feature space.
+To learn pixel-level representations of built-up surfaces from multi-spectral Sentinel-2 imagery, enriched with urban-discriminative spectral indices, using deep convolutional semantic segmentation.
 
 ---
 
-# 5️⃣ Ground Truth Generation
+## 🔄 Full Pipeline Workflow
 
-Supervised labels are derived from:
-
-- OpenStreetMap building footprints  
-- Google Open Buildings dataset (recommended)
-
-Building polygons are:
-
-- Reprojected to match Sentinel CRS  
-- Rasterized to 10 m resolution  
-- Spatially aligned with the spectral stack  
-
-Final output:
-
-Binary segmentation mask  
-Built-up = 1  
-Non built-up = 0  
-
----
-
-# 6️⃣ Machine Learning Framework
-
-## Model Architecture
-
-A modified UNet convolutional neural network:
-
-- Encoder-decoder structure  
-- Skip connections  
-- Multi-spectral 10-channel input  
-- Pixel-level classification output  
-
-UNet is chosen for its strong performance in spatial segmentation tasks.
+```
+1. Download lowest-cloud Sentinel-2 scenes (Planetary Computer STAC)
+       ↓
+2. Mosaic & clip scenes to AOI
+       ↓
+3. Build 10-band spectral feature stack
+       ↓
+4. Rasterize OSM / Google Open Buildings as binary labels
+       ↓
+5. Generate balanced image patches for training
+       ↓
+6. Train UNet segmentation model (BCE + Dice loss)
+       ↓
+7. Sliding-window inference over full AOI
+       ↓
+8. Evaluate segmentation performance (IoU)
+```
 
 ---
 
-## Loss Function
+## 🛰️ Input Data
 
-Combined objective:
+**Sentinel-2 Level-2A bands:**
 
-Loss = Binary Cross Entropy (BCE) + Dice Loss
+| Band | Name | Resolution |
+|---|---|---|
+| B02 | Blue | 10m |
+| B03 | Green | 10m |
+| B04 | Red | 10m |
+| B08 | Near Infrared | 10m |
+| B11 | Shortwave Infrared | 20m (resampled to 10m) |
 
-This balances:
+**Spectral indices computed:**
 
-- Pixel-wise classification accuracy  
-- Region-level spatial overlap  
+| Index | Purpose |
+|---|---|
+| NDVI | Vegetation contrast (inverse signal for built-up) |
+| NDBI | Built-up surface indicator |
+| NDWI | Water body detection |
+| BSI | Bare soil detection |
+| IBI | Integrated Built-up Index |
+
+**Final model input:** 10-channel feature stack `[B02, B03, B04, B08, B11, NDVI, NDBI, NDWI, BSI, IBI]`
 
 ---
 
-# 7️⃣ Evaluation Metric
+## 🤖 Model Architecture
 
-Primary metric:
+**UNet Semantic Segmentation**
+- Encoder-decoder structure with skip connections
+- 10-channel multi-spectral input
+- Pixel-level binary classification output (built-up / non built-up)
+- Chosen for strong spatial segmentation performance on remote sensing data
 
-Intersection over Union (IoU)
+**Loss Function:**
+```
+Loss = Binary Cross-Entropy (BCE) + Dice Loss
+```
+BCE handles pixel-wise accuracy; Dice Loss handles region-level spatial overlap.
 
+---
+
+## 📈 Performance
+
+**Primary metric: Intersection over Union (IoU)**
+
+```
 IoU = TP / (TP + FP + FN)
+```
 
-Where:
-- TP = True Positives  
-- FP = False Positives  
-- FN = False Negatives  
+| IoU Range | Interpretation |
+|---|---|
+| < 0.40 | Weak |
+| 0.40 – 0.59 | Moderate |
+| 0.60 – 0.70 | Strong |
+| > 0.70 | Research-grade |
 
-Performance interpretation:
-
-- < 0.4  → Weak  
-- 0.4–0.59 → Moderate  
-- 0.6–0.7 → Strong  
-- > 0.7 → Research-grade  
-
-Observed validation IoU ≈ 0.60+ for Sentinel-2 10m resolution.
+✅ **Observed validation IoU ≈ 0.60+** at Sentinel-2 10m resolution over Chennai.
 
 ---
 
-# 8️⃣ Full Pipeline Workflow
+## 🗂️ Project Structure
 
-1. Download lowest-cloud Sentinel-2 scenes  
-2. Mosaic and clip to AOI  
-3. Build 10-band spectral stack  
-4. Generate rasterized training labels  
-5. Create balanced image patches  
-6. Train UNet segmentation model  
-7. Perform sliding-window inference  
-8. Evaluate segmentation performance  
-
----
-
-# 9️⃣ Applications
-
-- Urban Heat Island modeling  
-- Flood risk assessment  
-- Impervious surface estimation  
-- Urban growth monitoring  
-- Climate resilience analysis  
-- Sustainable development research  
-
----
-
-# 🔟 Reproducibility
-
-Environment setup:
-
-conda env create -f environment.yml  
-conda activate chennai_climate  
-export PYTHONPATH=$(pwd)  
-export KMP_DUPLICATE_LIB_OK=TRUE  
-
-Run core pipeline:
-
-python scripts/00_download_sentinel2_best_per_year.py  
-python scripts/01_prepare_aoi_raw.py  
-python scripts/02_build_stack.py  
-python scripts/03_make_builtup_labels_from_osm.py  
-python -m scripts.dl.make_patches  
-python -m scripts.dl.train_unet  
-python -m scripts.dl.predict_unet  
+```
+chennai_urban_climate/
+│
+├── scripts/
+│   ├── 00_download_sentinel2_best_per_year.py   # Satellite acquisition
+│   ├── 01_prepare_aoi_raw.py                    # AOI preprocessing
+│   ├── 02_build_stack.py                        # Spectral stack builder
+│   ├── 03_make_builtup_labels_from_osm.py       # Label rasterization
+│   └── dl/
+│       ├── make_patches.py                      # Patch generation
+│       ├── train_unet.py                        # UNet training
+│       └── predict_unet.py                      # Inference
+│
+├── data/           # Satellite imagery, AOI, labels
+├── models/         # Saved model checkpoints
+├── outputs/        # Prediction maps and evaluation results
+├── run.py          # End-to-end runner script
+└── environment.yml
+```
 
 ---
 
-# 📜 License
+## ⚙️ Setup
 
-MIT License
+```bash
+conda env create -f environment.yml
+conda activate chennai_climate
+export PYTHONPATH=$(pwd)
+export KMP_DUPLICATE_LIB_OK=TRUE
+```
 
 ---
 
-# 🙏 Acknowledgements
+## ▶️ Run the Pipeline
 
-- ESA Sentinel-2 Mission  
-- Microsoft Planetary Computer  
-- OpenStreetMap  
-- Google Open Buildings Dataset  
+```bash
+# Step 1 — Download Sentinel-2 imagery
+python scripts/00_download_sentinel2_best_per_year.py
 
+# Step 2 — Prepare AOI
+python scripts/01_prepare_aoi_raw.py
+
+# Step 3 — Build spectral feature stack
+python scripts/02_build_stack.py
+
+# Step 4 — Generate training labels from OSM
+python scripts/03_make_builtup_labels_from_osm.py
+
+# Step 5 — Create image patches
+python -m scripts.dl.make_patches
+
+# Step 6 — Train UNet model
+python -m scripts.dl.train_unet
+
+# Step 7 — Run inference
+python -m scripts.dl.predict_unet
+```
+
+---
+
+## 🌍 Applications
+
+- Urban Heat Island modeling
+- Flood and surface runoff risk assessment
+- Impervious surface area estimation
+- Urban growth monitoring over time
+- Climate resilience and adaptation planning
+- Input layer for city-scale sustainability models
+
+---
+
+## 🗺️ Roadmap
+
+- [ ] Multi-city generalization (Bengaluru, Mumbai, Hyderabad)
+- [ ] Temporal change detection (built-up expansion over years)
+- [ ] DeepLabV3+ comparison study
+- [ ] Web map visualization of predictions
+
+---
+
+## 👤 Author
+
+**Athithiyan M R** — Geospatial Data Scientist | Remote Sensing | Climate Analytics
+
+[![LinkedIn](https://img.shields.io/badge/LinkedIn-Connect-0A66C2?style=flat-square&logo=linkedin)](https://www.linkedin.com/in/athithiyan-m-r-/)
+[![GitHub](https://img.shields.io/badge/GitHub-Athithiyanmr-181717?style=flat-square&logo=github)](https://github.com/Athithiyanmr)
+
+---
+
+## 🙏 Acknowledgements
+
+- ESA Sentinel-2 Mission
+- Microsoft Planetary Computer & STAC API
+- OpenStreetMap contributors
+- Google Open Buildings Dataset
+
+---
+
+## 📜 License
+
+MIT License © 2026 Athithiyan M R
