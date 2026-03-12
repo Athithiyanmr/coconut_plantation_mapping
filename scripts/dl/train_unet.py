@@ -9,7 +9,8 @@ from tqdm import tqdm
 from pathlib import Path
 
 from scripts.dl.dataset import BuiltupDataset
-from scripts.dl.unet_model import UNet
+# from scripts.dl.unet_model import UNet
+from scripts.dl.unet_transformer import UNetTransformer
 
 
 # -------------------------------------------------
@@ -77,7 +78,8 @@ print(f"Val patches:   {len(val_ds)}")
 # -------------------------------------------------
 # MODEL
 # -------------------------------------------------
-model = UNet(in_channels=10).to(device)
+# model = UNet(in_channels=10).to(device)
+model = UNetTransformer(in_channels=10).to(device)
 
 
 # -------------------------------------------------

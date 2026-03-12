@@ -71,7 +71,7 @@ with rasterio.open(STACK) as src:
 gdf = gdf.to_crs(crs)
 
 # Optional: small buffer improves rasterization
-gdf["geometry"] = gdf.buffer(0.5)
+# gdf["geometry"] = gdf.buffer(0)
 
 # ---------------------------------------
 # 4️⃣ Rasterize

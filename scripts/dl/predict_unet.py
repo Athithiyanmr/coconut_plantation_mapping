@@ -8,7 +8,8 @@ import numpy as np
 from tqdm import tqdm
 from pathlib import Path
 
-from scripts.dl.unet_model import UNet
+# from scripts.dl.unet_model import UNet
+from scripts.dl.unet_transformer import UNetTransformer
 
 
 # -------------------------------------------------
@@ -88,7 +89,8 @@ print("Size:", H, W)
 # -------------------------------------------------
 # LOAD MODEL
 # -------------------------------------------------
-model = UNet(in_channels=bands)
+# model = UNet(in_channels=bands)
+model = UNetTransformer(in_channels=10)
 
 model.load_state_dict(torch.load(MODEL, map_location=device))
 

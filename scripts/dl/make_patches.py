@@ -16,8 +16,8 @@ from rasterio.warp import reproject, Resampling
 parser = argparse.ArgumentParser()
 parser.add_argument("--year", required=True)
 parser.add_argument("--aoi", required=True)
-parser.add_argument("--patch", type=int, default=64)
-parser.add_argument("--stride", type=int, default=32)
+parser.add_argument("--patch", type=int, default=128)
+parser.add_argument("--stride", type=int, default=64)
 parser.add_argument("--clean", action="store_true")
 
 args = parser.parse_args()

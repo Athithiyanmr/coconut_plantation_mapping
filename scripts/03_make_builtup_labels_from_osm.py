@@ -60,7 +60,7 @@ with rasterio.open(REF) as ref:
 # 4. Reproject buildings
 # -------------------------------------------------
 buildings = buildings.to_crs(crs)
-buildings["geometry"] = buildings.buffer(1)
+buildings["geometry"] = buildings.buffer(0)
 
 # -------------------------------------------------
 # 5. Rasterize
