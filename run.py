@@ -72,13 +72,9 @@ run(f"python scripts/02_build_stack.py --year {YEAR} --aoi {AOI}")
 run('find . -name "._*" -type f -delete')
 
 # 4️⃣ Training labels
-if CSV:
-    run(
-        f"python scripts/03A_google_csv_to_training_mask.py "
-        f"--year {YEAR} --aoi {AOI} --csv {CSV}"
-    )
-else:
-    run(f"python scripts/03_make_builtup_labels_from_osm.py --year {YEAR} --aoi {AOI}")
+run(f"python scripts/03_google_csv_to_training_mask.py "
+        f"--year {YEAR} --aoi {AOI} --csv {CSV}")
+
 
 
 # 5️⃣ Create patches
