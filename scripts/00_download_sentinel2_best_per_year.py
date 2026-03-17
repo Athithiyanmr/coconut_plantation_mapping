@@ -28,7 +28,7 @@ log = logging.getLogger(__name__)
 parser = argparse.ArgumentParser(description="Download Sentinel-2 scenes via Planetary Computer STAC")
 parser.add_argument("--aoi",   required=True,            help="AOI name (matches shapefile in data/raw/boundaries/)")
 parser.add_argument("--year",  type=int, required=True,  help="Year to download")
-parser.add_argument("--cloud", type=int, default=40,     help="Max cloud cover % (default: 40)")
+parser.add_argument("--cloud", type=int, default=40,     help="Max cloud cover %% (default: 40)")
 args = parser.parse_args()
 
 AOI   = f"data/raw/boundaries/{args.aoi}.shp"
@@ -38,7 +38,7 @@ CLOUD = args.cloud
 OUT = Path("data/raw/sentinel2") / args.aoi / str(YEAR)
 OUT.mkdir(parents=True, exist_ok=True)
 
-BANDS = ["B02", "B03", "B04", "B08", "B11"]
+BANDS = ["B02", "B03", "B04", "B05", "B06", "B08", "B11", "B12"]
 
 # -----------------------------------------
 # SAFE DOWNLOAD (retry + progress + corruption check)
@@ -70,14 +70,14 @@ def download(url, out_path):
         log.info(f"Downloaded: {out_path}")
 
     except Exception as e:
-        log.error(f"Failed: {out_path.name} — {e}")
+        log.error(f"Failed: {out_path.name} -- {e}")
         tmp.unlink(missing_ok=True)
         raise  # re-raise so tenacity can retry
 
 # -----------------------------------------
 # LOAD AOI
 # -----------------------------------------
-print("📍 Loading AOI...")
+print("Loading AOI...")
 aoi  = gpd.read_file(AOI).to_crs("EPSG:4326")
 geom = aoi.geometry.iloc[0].__geo_interface__
 log.info(f"AOI loaded: {AOI}")
@@ -87,10 +87,10 @@ log.info(f"AOI loaded: {AOI}")
 # -----------------------------------------
 catalog = pystac_client.Client.open(
     "https://planetarycomputer.microsoft.com/api/stac/v1",
-    modifier=planetary_computer.sign_inplace,   # ✅ replaces manual sign(best)
+    modifier=planetary_computer.sign_inplace,
 )
 
-print(f"\n🔎 Searching Sentinel-2 {YEAR} | Cloud < {CLOUD}%")
+print(f"\nSearching Sentinel-2 {YEAR} | Cloud < {CLOUD}%%")
 log.info(f"Searching: year={YEAR}, cloud<{CLOUD}, AOI={args.aoi}")
 
 search = catalog.search(
@@ -100,10 +100,10 @@ search = catalog.search(
     query={"eo:cloud_cover": {"lt": CLOUD}},
 )
 
-items = search.item_collection()   # ✅ modern API, replaces list(search.get_items())
+items = search.item_collection()
 
 if not items:
-    raise RuntimeError("No scenes found — try relaxing --cloud threshold.")
+    raise RuntimeError("No scenes found -- try relaxing --cloud threshold.")
 
 print(f"   Found {len(items)} scenes")
 log.info(f"Found {len(items)} scenes")
@@ -118,7 +118,7 @@ for item in items:
     if tile:
         by_tile[tile].append(item)
 
-print("📦 Tiles intersecting AOI:", list(by_tile.keys()))
+print("Tiles intersecting AOI:", list(by_tile.keys()))
 
 # -----------------------------------------
 # DOWNLOAD BEST SCENE PER TILE
@@ -132,12 +132,11 @@ for tile, tile_items in by_tile.items():
         key=lambda x: x.properties.get("eo:cloud_cover", 100)
     )[0]
 
-    # No manual sign() needed — modifier=sign_inplace handles it
     tile_dir = OUT / f"T{tile}"
     tile_dir.mkdir(parents=True, exist_ok=True)
 
-    print(f"\n⬇  Tile  : {tile}")
-    print(f"   Cloud : {best.properties['eo:cloud_cover']}%")
+    print(f"\n   Tile  : {tile}")
+    print(f"   Cloud : {best.properties['eo:cloud_cover']}%%")
     print(f"   Date  : {best.datetime}")
 
     downloaded_bands = []
@@ -151,12 +150,12 @@ for tile, tile_items in by_tile.items():
         out_file = tile_dir / f"{band}.tif"
 
         if out_file.exists():
-            print(f"   ⏭  Skipping {band} (already exists)")
+            print(f"   Skipping {band} (already exists)")
             log.info(f"Skipped (exists): {out_file}")
             downloaded_bands.append(band)
             continue
 
-        print(f"   ⬇  Downloading: {band}")
+        print(f"   Downloading: {band}")
         download(asset.href, out_file)
         downloaded_bands.append(band)
 
@@ -176,6 +175,6 @@ manifest_path = OUT / "manifest.json"
 with open(manifest_path, "w") as f:
     json.dump(manifest, f, indent=2)
 
-print(f"\n📋 Manifest saved → {manifest_path}")
+print(f"\nManifest saved -> {manifest_path}")
 log.info(f"Manifest saved: {manifest_path}")
-print("\n✅ Sentinel-2 download complete")
+print("\nSentinel-2 download complete")

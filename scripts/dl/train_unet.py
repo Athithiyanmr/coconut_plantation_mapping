@@ -13,7 +13,7 @@ from torch import nn, optim
 from torch.utils.data import DataLoader, random_split
 from tqdm import tqdm
 
-from scripts.dl.dataset import BuiltupDataset
+from scripts.dl.dataset import CoconutDataset
 from scripts.dl.unet_transformer import UNetTransformer
 
 # -----------------------------------------
@@ -29,7 +29,7 @@ log = logging.getLogger(__name__)
 # -----------------------------------------
 # ARGUMENTS
 # -----------------------------------------
-parser = argparse.ArgumentParser(description="Train UNet-Transformer for built-up area segmentation")
+parser = argparse.ArgumentParser(description="Train UNet-Transformer for coconut plantation segmentation")
 parser.add_argument("--year",        required=True)
 parser.add_argument("--aoi",         required=True)
 parser.add_argument("--epochs",      type=int,   default=40,   help="Max training epochs (default: 40)")
@@ -69,7 +69,7 @@ elif torch.cuda.is_available():
 else:
     device = torch.device("cpu")
 
-print(f"💻 Device : {device}")
+print(f"Device : {device}")
 log.info(f"Device: {device}")
 
 # -----------------------------------------
@@ -84,10 +84,10 @@ if not img_dir.exists() or not mask_dir.exists():
         "Run make_patches.py first."
     )
 
-ds = BuiltupDataset(img_dir, mask_dir)
+ds = CoconutDataset(img_dir, mask_dir)
 
 if len(ds) == 0:
-    raise RuntimeError("Dataset is empty — check make_patches.py output.")
+    raise RuntimeError("Dataset is empty -- check make_patches.py output.")
 
 torch.manual_seed(42)
 val_size   = int(len(ds) * VAL_SPLIT)
@@ -111,7 +111,8 @@ class DiceLoss(nn.Module):
         )
 
 class FocalLoss(nn.Module):
-    def __init__(self, alpha=0.8, gamma=2.0):
+    def __init__(self, alpha=0.8, gamma=3.0):
+        """Focal loss with gamma=3.0 (increased from 2.0 for sparser coconut class)."""
         super().__init__()
         self.alpha = alpha
         self.gamma = gamma
@@ -142,11 +143,10 @@ def compute_metrics(pred, target, threshold):
     return iou, f1
 
 # -----------------------------------------
-# MAIN GUARD  ✅ required for macOS spawn multiprocessing
+# MAIN GUARD
 # -----------------------------------------
 if __name__ == "__main__":
 
-    # ✅ pin_memory only for CUDA — not supported on MPS
     pin = (device.type == "cuda")
 
     train_dl = DataLoader(
@@ -164,7 +164,7 @@ if __name__ == "__main__":
         pin_memory=pin,
     )
 
-    print(f"\n📦 Dataset   : {len(ds):,} patches")
+    print(f"\nDataset   : {len(ds):,} patches")
     print(f"   Train     : {len(train_ds):,}")
     print(f"   Val       : {len(val_ds):,}")
     log.info(f"Dataset: total={len(ds)}, train={len(train_ds)}, val={len(val_ds)}")
@@ -190,7 +190,7 @@ if __name__ == "__main__":
     patience_counter = 0
     history          = []
 
-    print(f"\n🚀 Training : {AOI} {YEAR}")
+    print(f"\nTraining : {AOI} {YEAR}")
     print(f"   Epochs   : {EPOCHS}  |  Batch : {BATCH_SIZE}  |  LR : {LR}")
     print(f"   Patience : {PATIENCE}  |  Threshold : {THRESHOLD}\n")
 
@@ -275,14 +275,14 @@ if __name__ == "__main__":
                     "year":        YEAR,
                 }
             }, BEST_CKPT)
-            print(f"  ✅ Best model saved (val_loss={val_loss:.4f})")
+            print(f"  Best model saved (val_loss={val_loss:.4f})")
             log.info(f"Best checkpoint: epoch={epoch}, val_loss={val_loss:.4f}")
 
         else:
             patience_counter += 1
-            print(f"  ⚠️  No improvement ({patience_counter}/{PATIENCE})")
+            print(f"  No improvement ({patience_counter}/{PATIENCE})")
             if patience_counter >= PATIENCE:
-                print("⏹️  Early stopping triggered")
+                print("Early stopping triggered")
                 log.info(f"Early stopping at epoch {epoch}")
                 break
 
@@ -300,14 +300,14 @@ if __name__ == "__main__":
     history_path = MODEL_DIR / f"history_{YEAR}_{AOI}.json"
     with open(history_path, "w") as f:
         json.dump(history, f, indent=2)
-    print(f"\n📊 History saved → {history_path}")
+    print(f"\nHistory saved -> {history_path}")
 
     # -----------------------------------------
     # FINAL SUMMARY
     # -----------------------------------------
     best = max(history, key=lambda x: x["iou"])
     print(f"\n{'='*55}")
-    print(f"✅ Training complete")
+    print(f"Training complete")
     print(f"   Best val loss : {best_val_loss:.4f}")
     print(f"   Best IoU      : {best['iou']:.4f}  (epoch {best['epoch']})")
     print(f"   Best F1       : {best['f1']:.4f}  (epoch {best['epoch']})")

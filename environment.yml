@@ -1,4 +1,4 @@
-name: chennai_climate
+name: coconut_mapping
 channels:
   - conda-forge
   - pytorch
@@ -20,9 +20,6 @@ dependencies:
   - fiona
   - gdal
 
-  # --- OSM ---
-  - osmnx
-
   # --- Visualization ---
   - matplotlib
   - tqdm
@@ -36,5 +33,5 @@ dependencies:
   - pip:
       - planetary-computer
       - pystac-client
-      - geoai-py
-      
+      - tenacity
+      - requests

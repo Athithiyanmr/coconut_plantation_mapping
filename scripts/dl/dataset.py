@@ -3,7 +3,7 @@ import torch
 from torch.utils.data import Dataset
 from pathlib import Path
 
-class BuiltupDataset(Dataset):
+class CoconutDataset(Dataset):
     def __init__(self, img_dir, mask_dir):
         self.imgs = sorted(Path(img_dir).glob("*.npy"))
         self.masks = sorted(Path(mask_dir).glob("*.npy"))

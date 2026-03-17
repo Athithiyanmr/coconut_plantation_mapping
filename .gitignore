@@ -20,7 +20,7 @@ Thumbs.db
 env/
 venv/
 .venv/
-chennai_climate/
+coconut_mapping/
 *.conda
 
 # =========================================

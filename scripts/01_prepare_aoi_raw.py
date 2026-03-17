@@ -27,22 +27,22 @@ log = logging.getLogger(__name__)
 parser = argparse.ArgumentParser(description="Merge, clip and reproject Sentinel-2 tiles to AOI")
 parser.add_argument("--aoi",    required=True, help="AOI name (without path/extension)")
 parser.add_argument("--year",   required=True, help="Year to process")
-parser.add_argument("--target_crs", default="EPSG:32644", help="Target CRS for output (default: UTM Zone 44N for Chennai)")
+parser.add_argument("--target_crs", default="EPSG:32643", help="Target CRS for output (default: UTM Zone 43N for Coimbatore)")
 args = parser.parse_args()
 
 AOI_PATH = f"data/raw/boundaries/{args.aoi}.shp"
 RAW_DIR  = Path("data/raw/sentinel2")         / args.aoi / args.year
-OUT_DIR  = Path("data/processed/sentinel2_clipped") / args.aoi / args.year   # ✅ moved to processed/
+OUT_DIR  = Path("data/processed/sentinel2_clipped") / args.aoi / args.year
 
-# SCL added for cloud masking support
-BANDS       = ["B02", "B03", "B04", "B08", "B11", "SCL"]
+# B05 and B06 added for red edge vegetation detection; B12 for SWIR2; SCL for cloud masking
+BANDS       = ["B02", "B03", "B04", "B05", "B06", "B08", "B11", "B12", "SCL"]
 TARGET_CRS  = args.target_crs
 
 OUT_DIR.mkdir(parents=True, exist_ok=True)
 
-print(f"\n📍 AOI  : {args.aoi}")
-print(f"📅 Year : {args.year}")
-print(f"🗺  CRS  : {TARGET_CRS}")
+print(f"\nAOI  : {args.aoi}")
+print(f"Year : {args.year}")
+print(f"CRS  : {TARGET_CRS}")
 log.info(f"Starting preprocess: AOI={args.aoi}, year={args.year}, crs={TARGET_CRS}")
 
 # -----------------------------------------
@@ -88,13 +88,13 @@ for band in BANDS:
     band_files = sorted(RAW_DIR.glob(f"**/*{band}.tif"))
 
     if not band_files:
-        msg = f"No files found for {band} — skipping"
-        print(f"⚠️  {msg}")
+        msg = f"No files found for {band} -- skipping"
+        print(f"   {msg}")
         log.warning(msg)
         skipped.append(band)
         continue
 
-    print(f"\n🔧 Processing band: {band} ({len(band_files)} tile(s))")
+    print(f"\nProcessing band: {band} ({len(band_files)} tile(s))")
     log.info(f"Processing {band}: {[str(f) for f in band_files]}")
 
     try:
@@ -103,7 +103,7 @@ for band in BANDS:
         # -----------------------------------------
         # MERGE TILES
         # -----------------------------------------
-        mosaic, transform = merge(srcs, nodata=0, method="first")  # ✅ explicit method
+        mosaic, transform = merge(srcs, nodata=0, method="first")
 
         meta = srcs[0].meta.copy()
         meta.update(
@@ -112,8 +112,8 @@ for band in BANDS:
             height=mosaic.shape[1],
             width=mosaic.shape[2],
             nodata=0,
-            compress="lzw",          # ✅ compress output TIFs
-            tiled=True,              # ✅ cloud-optimized tiling
+            compress="lzw",
+            tiled=True,
             blockxsize=256,
             blockysize=256,
         )
@@ -125,7 +125,7 @@ for band in BANDS:
         # REPROJECT TO TARGET CRS
         # -----------------------------------------
         if str(meta["crs"]) != TARGET_CRS:
-            print(f"   🔄 Reprojecting from {meta['crs']} → {TARGET_CRS}")
+            print(f"   Reprojecting from {meta['crs']} -> {TARGET_CRS}")
             mosaic, meta = reproject_to_target(mosaic, meta, TARGET_CRS)
             log.info(f"{band}: reprojected to {TARGET_CRS}")
 
@@ -136,7 +136,7 @@ for band in BANDS:
         geoms    = list(aoi_proj.geometry)
 
         # -----------------------------------------
-        # CLIP TO AOI (via MemoryFile — avoids temp disk writes)
+        # CLIP TO AOI (via MemoryFile -- avoids temp disk writes)
         # -----------------------------------------
         with rasterio.io.MemoryFile() as memfile:
             with memfile.open(**meta) as tmp:
@@ -146,7 +146,7 @@ for band in BANDS:
                     geoms,
                     crop=True,
                     nodata=0,
-                    all_touched=True,   # ✅ include edge pixels touching AOI
+                    all_touched=True,
                 )
 
         meta.update(
@@ -163,12 +163,12 @@ for band in BANDS:
             dst.write(clipped)
 
         size_mb = out_path.stat().st_size / 1_000_000
-        print(f"   ✅ {band} saved → {out_path} ({size_mb:.1f} MB)")
+        print(f"   {band} saved -> {out_path} ({size_mb:.1f} MB)")
         log.info(f"{band} saved: {out_path} ({size_mb:.1f} MB)")
 
     except Exception as e:
         msg = f"Failed processing {band}: {e}"
-        print(f"   ❌ {msg}")
+        print(f"   {msg}")
         log.error(msg)
         failed.append(band)
 
@@ -176,9 +176,9 @@ for band in BANDS:
 # SUMMARY
 # -----------------------------------------
 print(f"\n{'='*50}")
-print(f"✅ Done    : {[b for b in BANDS if b not in skipped and b not in failed]}")
-print(f"⚠️  Skipped : {skipped or 'None'}")
-print(f"❌ Failed  : {failed or 'None'}")
-print(f"📁 Output  : {OUT_DIR}")
+print(f"Done    : {[b for b in BANDS if b not in skipped and b not in failed]}")
+print(f"Skipped : {skipped or 'None'}")
+print(f"Failed  : {failed or 'None'}")
+print(f"Output  : {OUT_DIR}")
 print(f"{'='*50}")
 log.info(f"Preprocess complete. Skipped={skipped}, Failed={failed}")
