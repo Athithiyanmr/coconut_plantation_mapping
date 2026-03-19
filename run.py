@@ -62,7 +62,7 @@ run('find . -name "._*" -type f -delete')
 if not args.skip_download:
     run(f"python scripts/00_download_sentinel2_best_per_year.py --year {YEAR} --aoi {AOI}")
 
-
+run('find . -name "._*" -type f -delete')
 # 2. AOI clip
 run(f"python scripts/01_prepare_aoi_raw.py --year {YEAR} --aoi {AOI}")
 
@@ -78,7 +78,7 @@ if LABEL_DIR:
     run(f"python scripts/03_download_coconut_labels.py "
         f"--year {YEAR} --aoi {AOI} --label_dir {LABEL_DIR}")
 
-
+run('find . -name "._*" -type f -delete')
 # 5. Create patches
 run(
     f"python -m scripts.dl.make_patches "
