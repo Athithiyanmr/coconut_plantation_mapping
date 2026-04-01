@@ -11,14 +11,19 @@ parser = argparse.ArgumentParser()
 parser.add_argument("--year", required=True)
 parser.add_argument("--aoi", required=True)
 
-# Coconut label directory (Descals tiles)
+# Coconut label source:
+#   Pass a .shp file  -> rasterize manually digitized polygons
+#   Pass a directory  -> use Descals et al. (2023) tiles
 parser.add_argument("--label_dir", default=None,
-                    help="Directory containing extracted Descals coconut GeoTIFF tiles")
+                    help="Coconut label source: path to a .shp file (manual polygons) "
+                         "or a directory containing Descals GeoTIFF tiles")
 
 # DL tuning
 parser.add_argument("--patch", type=int, default=64)
 parser.add_argument("--stride", type=int, default=32)
 parser.add_argument("--threshold", type=float, default=0.35)
+parser.add_argument("--all_touched", action="store_true",
+                    help="(Shapefile mode only) Burn pixels touching polygon edges")
 
 # optional skip flags
 parser.add_argument("--skip_download", action="store_true")
@@ -26,11 +31,11 @@ parser.add_argument("--skip_train", action="store_true")
 
 args = parser.parse_args()
 
-YEAR = args.year
-AOI = args.aoi
+YEAR      = args.year
+AOI       = args.aoi
 LABEL_DIR = args.label_dir
-PATCH = args.patch
-STRIDE = args.stride
+PATCH     = args.patch
+STRIDE    = args.stride
 THRESHOLD = args.threshold
 
 
@@ -49,6 +54,13 @@ def run(cmd):
 
 
 # --------------------------------
+# Detect label mode
+# --------------------------------
+def is_shapefile(path):
+    return path is not None and str(path).lower().endswith(".shp")
+
+
+# --------------------------------
 # CLEAN hidden files
 # --------------------------------
 run('find . -name "._*" -type f -delete')
@@ -63,6 +75,7 @@ if not args.skip_download:
     run(f"python scripts/00_download_sentinel2_best_per_year.py --year {YEAR} --aoi {AOI}")
 
 run('find . -name "._*" -type f -delete')
+
 # 2. AOI clip
 run(f"python scripts/01_prepare_aoi_raw.py --year {YEAR} --aoi {AOI}")
 
@@ -73,12 +86,32 @@ run(f"python scripts/02_build_stack.py --year {YEAR} --aoi {AOI}")
 
 run('find . -name "._*" -type f -delete')
 
-# 4. Coconut labels from Descals et al.
+# 4. Coconut labels
 if LABEL_DIR:
-    run(f"python scripts/03_download_coconut_labels.py "
-        f"--year {YEAR} --aoi {AOI} --label_dir {LABEL_DIR}")
+    if is_shapefile(LABEL_DIR):
+        # --- Manual polygon mode ---
+        print(f"\n[Label mode] Shapefile detected -> rasterizing manual polygons")
+        all_touched_flag = "--all_touched" if args.all_touched else ""
+        run(
+            f"python scripts/03_rasterize_manual_labels.py "
+            f"--year {YEAR} --aoi {AOI} "
+            f"--shp {LABEL_DIR} "
+            f"{all_touched_flag}"
+        )
+    else:
+        # --- Descals tiles mode ---
+        print(f"\n[Label mode] Directory detected -> using Descals et al. (2023) tiles")
+        run(
+            f"python scripts/03_download_coconut_labels.py "
+            f"--year {YEAR} --aoi {AOI} --label_dir {LABEL_DIR}"
+        )
+else:
+    print("\n[Label mode] --label_dir not provided -- skipping label step")
+    print("             Labels must already exist at:")
+    print(f"             data/processed/training/labels_coconut_{YEAR}_{AOI}.tif")
 
 run('find . -name "._*" -type f -delete')
+
 # 5. Create patches
 run(
     f"python -m scripts.dl.make_patches "
