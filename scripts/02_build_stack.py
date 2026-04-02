@@ -20,13 +20,25 @@ log = logging.getLogger(__name__)
 # -----------------------------------------
 # ARGUMENTS
 # -----------------------------------------
-parser = argparse.ArgumentParser(description="Build multi-band stack with vegetation spectral indices")
+parser = argparse.ArgumentParser(description="Build multi-band stack with vegetation spectral indices and canopy height")
 parser.add_argument("--aoi",  required=True, help="AOI name")
 parser.add_argument("--year", required=True, help="Year to process")
+parser.add_argument(
+    "--canopy_height",
+    default=None,
+    help=(
+        "Path to WRI/Meta canopy height GeoTIFF (1 m resolution). "
+        "Dataset: Meta & WRI High Resolution Canopy Height Maps (2018-2020). "
+        "GEE: ee.ImageCollection('projects/sat-io/open-datasets/facebook/meta-canopy-height') "
+        "AWS S3: s3://dataforgood-fb-data/forests/v1/alsgedi_global_v6_float/ "
+        "If omitted the canopy height band is skipped."
+    ),
+)
 args = parser.parse_args()
 
 AOI  = args.aoi
 YEAR = args.year
+CANOPY_HEIGHT_PATH = Path(args.canopy_height) if args.canopy_height else None
 
 RAW_DIR = Path("data/processed/sentinel2_clipped") / AOI / YEAR
 OUT_DIR = Path("data/processed") / AOI
@@ -35,10 +47,16 @@ OUT_DIR.mkdir(parents=True, exist_ok=True)
 BANDS = ["B02", "B03", "B04", "B05", "B06", "B08", "B11", "B12"]
 
 # Band index labels for documentation
-BAND_NAMES = ["B02", "B03", "B04", "B05", "B06", "B08", "B11", "B12", "NDVI", "EVI", "NDMI"]
+# 8 raw Sentinel-2 bands + 3 vegetation indices + (optionally) canopy height
+BAND_NAMES = ["B02", "B03", "B04", "B05", "B06", "B08", "B11", "B12",
+              "NDVI", "EVI", "NDMI"]
+if CANOPY_HEIGHT_PATH is not None:
+    BAND_NAMES.append("CanopyHeight_m")
 
 print(f"\nBuilding stack: {AOI} {YEAR}")
-log.info(f"Starting stack build: AOI={AOI}, year={YEAR}")
+if CANOPY_HEIGHT_PATH:
+    print(f"   Canopy height layer : {CANOPY_HEIGHT_PATH}")
+log.info(f"Starting stack build: AOI={AOI}, year={YEAR}, canopy_height={CANOPY_HEIGHT_PATH}")
 
 # -----------------------------------------
 # LOAD REFERENCE BAND (B02)
@@ -55,7 +73,7 @@ with rasterio.open(ref_path) as ref:
 log.info(f"Reference band loaded: shape={ref_arr.shape}, CRS={ref_meta['crs']}")
 
 # -----------------------------------------
-# LOAD + ALIGN ALL BANDS
+# LOAD + ALIGN ALL SENTINEL-2 BANDS
 # -----------------------------------------
 arrays = [ref_arr]
 
@@ -93,7 +111,7 @@ b2, b3, b4, b5, b6, b8, b11, b12 = arrays
 nodata_mask = (b2 == nodata)
 valid_px    = int(np.sum(~nodata_mask))
 total_px    = b2.size
-print(f"\nValid pixels : {valid_px:,} / {total_px:,} ({100*valid_px/total_px:.1f}%%)")
+print(f"\nValid pixels : {valid_px:,} / {total_px:,} ({100*valid_px/total_px:.1f}%)")
 log.info(f"Valid pixels: {valid_px}/{total_px}")
 
 # -----------------------------------------
@@ -128,11 +146,76 @@ for name, arr in [("NDVI", ndvi), ("EVI", evi), ("NDMI", ndmi)]:
     log.info(f"{name} P1={pct1:.3f}, P99={pct99:.3f}")
 
 # -----------------------------------------
-# STACK  (11 bands: 8 raw + 3 vegetation indices)
-# B02, B03, B04, B05, B06, B08, B11, B12, NDVI, EVI, NDMI
+# CANOPY HEIGHT BAND  (WRI / Meta, 1-m resolution)
+# Dataset: "High Resolution Canopy Height Maps" — Meta & WRI, 2024
+#   - Temporal coverage: 2018-2020 (80 % of pixels from 2018-2020)
+#   - Resolution: 1 m (resampled to Sentinel-2 10 m grid here via bilinear)
+#   - Units: metres above ground for all vegetation ≥ 1 m
+#   - Mean absolute error: 2.8 m (Tolan et al., 2024, RSE 300, 113888)
+#   - License: CC BY 4.0
+#   - GEE asset: ee.ImageCollection("projects/sat-io/open-datasets/facebook/meta-canopy-height")
+#   - AWS S3:    s3://dataforgood-fb-data/forests/v1/alsgedi_global_v6_float/
+#
+# Why it helps coconut mapping:
+#   Coconut palms are tall (15-30 m), slender-canopied trees.  Adding canopy
+#   height cleanly separates them from low scrub, paddy, and banana which share
+#   similar spectral signatures but are <5 m tall.  The height band acts as a
+#   structural filter that reduces false positives from spectrally similar crops.
 # -----------------------------------------
-stack = np.stack([b2s, b3s, b4s, b5s, b6s, b8s, b11s, b12s,
-                  ndvi, evi, ndmi]).astype("float32")
+canopy_arr = None
+
+if CANOPY_HEIGHT_PATH is not None:
+    if not CANOPY_HEIGHT_PATH.exists():
+        raise FileNotFoundError(
+            f"Canopy height file not found: {CANOPY_HEIGHT_PATH}\n"
+            "Download from:\n"
+            "  GEE  : ee.ImageCollection('projects/sat-io/open-datasets/facebook/meta-canopy-height')\n"
+            "  AWS  : s3://dataforgood-fb-data/forests/v1/alsgedi_global_v6_float/\n"
+            "  Meta : https://ai.meta.com/ai-for-good/datasets/canopy-height-maps/"
+        )
+
+    print("\n   Loading canopy height layer...")
+    with rasterio.open(CANOPY_HEIGHT_PATH) as src:
+        raw_ch = src.read(1).astype("float32")
+        ch_nodata = src.nodata
+
+        # Replace source nodata with NaN
+        if ch_nodata is not None:
+            raw_ch = np.where(raw_ch == ch_nodata, np.nan, raw_ch)
+
+        # Reproject / resample to Sentinel-2 reference grid
+        # Bilinear resampling is appropriate for a continuous height surface.
+        canopy_arr = np.empty(ref_arr.shape, dtype="float32")
+        reproject(
+            raw_ch, canopy_arr,
+            src_transform=src.transform,
+            src_crs=src.crs,
+            dst_transform=ref_meta["transform"],
+            dst_crs=ref_meta["crs"],
+            resampling=Resampling.bilinear,
+        )
+
+    # Apply same nodata mask as Sentinel-2 bands
+    canopy_arr[nodata_mask] = np.nan
+
+    # Clip to physically plausible coconut palm heights: 0 – 45 m
+    # (extreme outliers from the CHM can reach 60+ m in error pixels)
+    canopy_arr = np.clip(canopy_arr, 0.0, 45.0)
+
+    ch_valid = canopy_arr[~nodata_mask & ~np.isnan(canopy_arr)]
+    p1, p99  = np.nanpercentile(ch_valid, [1, 99])
+    print(f"   CanopyHt range: [{p1:.1f}, {p99:.1f}] m  (P1–P99)")
+    log.info(f"CanopyHeight P1={p1:.1f}m, P99={p99:.1f}m")
+
+# -----------------------------------------
+# STACK  (11 bands without canopy height, 12 with)
+# B02, B03, B04, B05, B06, B08, B11, B12, NDVI, EVI, NDMI [, CanopyHeight_m]
+# -----------------------------------------
+band_arrays = [b2s, b3s, b4s, b5s, b6s, b8s, b11s, b12s, ndvi, evi, ndmi]
+if canopy_arr is not None:
+    band_arrays.append(canopy_arr)
+
+stack = np.stack(band_arrays).astype("float32")
 
 # Apply nodata mask across all bands
 stack[:, nodata_mask] = np.nan
@@ -140,8 +223,9 @@ stack[:, nodata_mask] = np.nan
 # -----------------------------------------
 # SAVE WITH BAND DESCRIPTIONS
 # -----------------------------------------
+n_bands = len(BAND_NAMES)
 ref_meta.update(
-    count=11,
+    count=n_bands,
     dtype="float32",
     nodata=np.nan,
     compress="lzw",
@@ -157,7 +241,21 @@ with rasterio.open(out_path, "w", **ref_meta) as dst:
     for i, name in enumerate(BAND_NAMES, start=1):
         dst.update_tags(i, name=name)
 
+    # Record canopy height dataset provenance in file-level metadata
+    if canopy_arr is not None:
+        dst.update_tags(
+            canopy_height_source="Meta & WRI High Resolution Canopy Height Maps (2024)",
+            canopy_height_resolution_native="1m",
+            canopy_height_resampled_to="Sentinel-2 10m grid (bilinear)",
+            canopy_height_units="metres above ground",
+            canopy_height_temporal_coverage="2018-2020",
+            canopy_height_citation=(
+                "Tolan et al. (2024) Remote Sensing of Environment 300, 113888. "
+                "Meta & WRI High Resolution Canopy Height Maps. CC BY 4.0."
+            ),
+        )
+
 size_mb = out_path.stat().st_size / 1_000_000
 print(f"\nStack saved -> {out_path} ({size_mb:.1f} MB)")
-print(f"   Bands ({len(BAND_NAMES)}): {', '.join(BAND_NAMES)}")
+print(f"   Bands ({n_bands}): {', '.join(BAND_NAMES)}")
 log.info(f"Stack saved: {out_path}, bands={BAND_NAMES}, size={size_mb:.1f}MB")
