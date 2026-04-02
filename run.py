@@ -18,6 +18,18 @@ parser.add_argument("--label_dir", default=None,
                     help="Coconut label source: path to a .shp file (manual polygons) "
                          "or a directory containing Descals GeoTIFF tiles")
 
+# WRI / Meta canopy height layer (optional)
+# Dataset: Meta & WRI High Resolution Canopy Height Maps (2024), 1 m resolution
+# Download options:
+#   GEE  : ee.ImageCollection('projects/sat-io/open-datasets/facebook/meta-canopy-height')
+#   AWS  : aws s3 cp --no-sign-request s3://dataforgood-fb-data/forests/v1/alsgedi_global_v6_float/ .
+#   Meta : https://ai.meta.com/ai-for-good/datasets/canopy-height-maps/
+parser.add_argument("--canopy_height", default=None,
+                    help="Path to WRI/Meta canopy height GeoTIFF (.tif). "
+                         "When provided, a CanopyHeight_m band is added to the stack "
+                         "(Band 12). Coconut palms (15-30 m) are clearly separated "
+                         "from low-canopy crops using this structural layer.")
+
 # DL tuning
 parser.add_argument("--patch", type=int, default=64)
 parser.add_argument("--stride", type=int, default=32)
@@ -31,12 +43,13 @@ parser.add_argument("--skip_train", action="store_true")
 
 args = parser.parse_args()
 
-YEAR      = args.year
-AOI       = args.aoi
-LABEL_DIR = args.label_dir
-PATCH     = args.patch
-STRIDE    = args.stride
-THRESHOLD = args.threshold
+YEAR          = args.year
+AOI           = args.aoi
+LABEL_DIR     = args.label_dir
+CANOPY_HEIGHT = args.canopy_height
+PATCH         = args.patch
+STRIDE        = args.stride
+THRESHOLD     = args.threshold
 
 
 # --------------------------------
@@ -81,8 +94,11 @@ run(f"python scripts/01_prepare_aoi_raw.py --year {YEAR} --aoi {AOI}")
 
 run('find . -name "._*" -type f -delete')
 
-# 3. Build stack
-run(f"python scripts/02_build_stack.py --year {YEAR} --aoi {AOI}")
+# 3. Build stack (optionally with canopy height)
+stack_cmd = f"python scripts/02_build_stack.py --year {YEAR} --aoi {AOI}"
+if CANOPY_HEIGHT:
+    stack_cmd += f" --canopy_height {CANOPY_HEIGHT}"
+run(stack_cmd)
 
 run('find . -name "._*" -type f -delete')
 
