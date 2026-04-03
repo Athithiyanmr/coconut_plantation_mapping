@@ -134,52 +134,38 @@ parser.add_argument("--dilate",     type=int,   default=1,
                     help="Label mask dilation iterations (default: 1)")
 
 # --- Training ---
-parser.add_argument("--epochs",        type=int,   default=40,
-                    help="Training epochs (default: 40)")
-parser.add_argument("--batch",         type=int,   default=8,
-                    help="Batch size (default: 8)")
-parser.add_argument("--lr",            type=float, default=1e-4,
-                    help="Learning rate (default: 1e-4)")
-parser.add_argument("--val_split",     type=float, default=0.2,
-                    help="Validation fraction, stratified (default: 0.2)")
-parser.add_argument("--patience",      type=int,   default=6,
-                    help="Early stopping patience (default: 6)")
-parser.add_argument("--pos_oversample", type=float, default=5.0,
-                    help="Positive patch oversampling multiplier for\n"
-                         "WeightedRandomSampler (default: 5.0)")
+parser.add_argument("--epochs",        type=int,   default=40)
+parser.add_argument("--batch",         type=int,   default=8)
+parser.add_argument("--lr",            type=float, default=1e-4)
+parser.add_argument("--val_split",     type=float, default=0.2)
+parser.add_argument("--patience",      type=int,   default=6)
+parser.add_argument("--pos_oversample", type=float, default=5.0)
 
 # --- Threshold search ---
-parser.add_argument("--threshold",   type=float, default=None,
-                    help="Fixed decision threshold (0-1). If omitted, auto-searched.")
+parser.add_argument("--threshold",   type=float, default=None)
 parser.add_argument("--t_min",       type=float, default=0.20)
 parser.add_argument("--t_max",       type=float, default=0.80)
 parser.add_argument("--t_step",      type=float, default=0.02)
 parser.add_argument("--t_fine_step", type=float, default=0.005)
-parser.add_argument("--thr_metric",  choices=["f1", "iou"], default="f1",
-                    help="Metric to optimise during threshold search (default: f1)")
+parser.add_argument("--thr_metric",  choices=["f1", "iou"], default="f1")
 
 # --- Prediction ---
-parser.add_argument("--pred_stride", type=int, default=32,
-                    help="Sliding-window stride for inference (default: 32)")
-parser.add_argument("--pred_batch",  type=int, default=8,
-                    help="Batch size for inference (default: 8)")
+parser.add_argument("--pred_stride", type=int, default=32)
+parser.add_argument("--pred_batch",  type=int, default=8)
 
 # --- Workflow control ---
-parser.add_argument("--skip_stack",    action="store_true", help="Skip Step 1 (stack build)")
-parser.add_argument("--skip_labels",   action="store_true", help="Skip Step 2 (label prep)")
-parser.add_argument("--skip_patches",  action="store_true", help="Skip Step 3 (patch generation)")
-parser.add_argument("--skip_train",    action="store_true", help="Skip Step 4 (training)")
-parser.add_argument("--skip_predict",  action="store_true", help="Skip Step 5 (inference)")
-parser.add_argument("--skip_evaluate", action="store_true", help="Skip Step 6 (evaluation)")
-parser.add_argument("--workers",       type=int, default=0,
-                    help="DataLoader workers (0=main process, default: 0)")
+parser.add_argument("--skip_stack",    action="store_true")
+parser.add_argument("--skip_labels",   action="store_true")
+parser.add_argument("--skip_patches",  action="store_true")
+parser.add_argument("--skip_train",    action="store_true")
+parser.add_argument("--skip_predict",  action="store_true")
+parser.add_argument("--skip_evaluate", action="store_true")
+parser.add_argument("--workers",       type=int, default=0)
 parser.add_argument("--seed",          type=int, default=42)
-parser.add_argument("--clean_patches", action="store_true",
-                    help="Delete old patches before regenerating")
+parser.add_argument("--clean_patches", action="store_true")
 
 args = parser.parse_args()
 
-# Validate
 if not args.skip_labels and args.label_dir is None:
     print(
         "WARNING: --label_dir not provided.\n"
@@ -187,6 +173,32 @@ if not args.skip_labels and args.label_dir is None:
         "  manual  mode: pass your .shp polygon file with --label_dir\n"
         "  Use --skip_labels to suppress this warning."
     )
+
+
+# ============================================================
+# HELPERS
+# ============================================================
+
+def purge_macos_ghosts():
+    """
+    Delete macOS dot-underscore (._*) metadata files from the entire
+    project tree.  These are written silently by macOS Finder / CopyFile
+    on external and network volumes and will corrupt numpy file globbing.
+    Safe to run on every platform -- `find` is POSIX-standard.
+    """
+    import platform
+    if platform.system() != "Darwin":
+        return   # only macOS creates these
+    result = subprocess.run(
+        ["find", ".", "-name", "._*", "-type", "f", "-delete"],
+        capture_output=True, text=True,
+    )
+    # Silently ignore errors (e.g. permission-denied on .git internals)
+    deleted = [l for l in result.stdout.splitlines() if l.strip()]
+    if deleted:
+        print(f"  [cleanup] Removed {len(deleted)} macOS ._* ghost file(s)")
+    else:
+        print("  [cleanup] No macOS ._* ghost files found")
 
 
 def run(cmd):
@@ -201,11 +213,10 @@ def run(cmd):
 
 # ============================================================
 # STEP 1  --  BUILD FEATURE STACK
-# Output: data/processed/{aoi}/stack_{year}.tif
-# Bands:  11 (spectral) or 12 (+ canopy height)
 # ============================================================
 if not args.skip_stack:
     print("\nSTEP 1/6  --  Build feature stack")
+    purge_macos_ghosts()
     cmd = [
         sys.executable, "scripts/02_build_stack.py",
         "--year", args.year,
@@ -222,10 +233,10 @@ else:
 
 # ============================================================
 # STEP 2  --  PREPARE LABELS
-# Output: data/processed/training/labels_coconut_{year}_{aoi}.tif
 # ============================================================
 if not args.skip_labels:
     print("\nSTEP 2/6  --  Prepare labels")
+    purge_macos_ghosts()
     if args.label_mode == "descals":
         if args.label_dir is None:
             print("ERROR: --label_dir required for --label_mode descals")
@@ -252,10 +263,10 @@ else:
 
 # ============================================================
 # STEP 3  --  GENERATE PATCHES
-# Output: data/dl/{year}_{aoi}/images/*.npy  +  masks/*.npy
 # ============================================================
 if not args.skip_patches:
     print("\nSTEP 3/6  --  Generate patches")
+    purge_macos_ghosts()
     cmd = [
         sys.executable, "scripts/dl/make_patches.py",
         "--year",       args.year,
@@ -277,27 +288,27 @@ else:
 
 # ============================================================
 # STEP 4  --  TRAIN
-# Output: models/{aoi}_{year}_best.pth  +  training_history.json
 # ============================================================
 if not args.skip_train:
     print("\nSTEP 4/6  --  Train UNet-Transformer")
+    purge_macos_ghosts()
     cmd = [
         sys.executable, "scripts/dl/train_unet.py",
-        "--year",          args.year,
-        "--aoi",           args.aoi,
-        "--epochs",        str(args.epochs),
-        "--batch",         str(args.batch),
-        "--lr",            str(args.lr),
-        "--val_split",     str(args.val_split),
-        "--patience",      str(args.patience),
-        "--pos_oversample",str(args.pos_oversample),
-        "--workers",       str(args.workers),
-        "--t_min",         str(args.t_min),
-        "--t_max",         str(args.t_max),
-        "--t_step",        str(args.t_step),
-        "--t_fine_step",   str(args.t_fine_step),
-        "--metric",        str(args.thr_metric),
-        "--seed",          str(args.seed),
+        "--year",           args.year,
+        "--aoi",            args.aoi,
+        "--epochs",         str(args.epochs),
+        "--batch",          str(args.batch),
+        "--lr",             str(args.lr),
+        "--val_split",      str(args.val_split),
+        "--patience",       str(args.patience),
+        "--pos_oversample", str(args.pos_oversample),
+        "--workers",        str(args.workers),
+        "--t_min",          str(args.t_min),
+        "--t_max",          str(args.t_max),
+        "--t_step",         str(args.t_step),
+        "--t_fine_step",    str(args.t_fine_step),
+        "--metric",         str(args.thr_metric),
+        "--seed",           str(args.seed),
     ]
     if args.threshold is not None:
         cmd += ["--threshold", str(args.threshold)]
@@ -308,10 +319,10 @@ else:
 
 # ============================================================
 # STEP 5  --  INFERENCE
-# Output: outputs/{aoi}_{year}_prediction.tif
 # ============================================================
 if not args.skip_predict:
     print("\nSTEP 5/6  --  Run inference")
+    purge_macos_ghosts()
     cmd = [
         sys.executable, "scripts/dl/predict_unet.py",
         "--year",   args.year,
@@ -329,10 +340,10 @@ else:
 
 # ============================================================
 # STEP 6  --  EVALUATE
-# Output: outputs/{aoi}_{year}_metrics.json  +  confusion matrix
 # ============================================================
 if not args.skip_evaluate:
     print("\nSTEP 6/6  --  Evaluate")
+    purge_macos_ghosts()
     cmd = [
         sys.executable, "scripts/evaluate_iou.py",
         "--year",        args.year,
@@ -355,19 +366,19 @@ else:
 # ============================================================
 print(f"\n{'='*65}")
 print("PIPELINE COMPLETE")
-print(f"   AOI          : {args.aoi}")
-print(f"   Year         : {args.year}")
-print(f"   Labels       : {args.label_mode}" +
+print(f"   AOI           : {args.aoi}")
+print(f"   Year          : {args.year}")
+print(f"   Labels        : {args.label_mode}" +
       (f"  ({args.label_dir})" if args.label_dir else ""))
 if args.canopy_tn:
-    print(f"   Canopy       : TN mosaic  (auto-clipped to {args.aoi})")
+    print(f"   Canopy        : TN mosaic  (auto-clipped to {args.aoi})")
 elif args.canopy_height:
-    print(f"   Canopy       : {args.canopy_height}")
+    print(f"   Canopy        : {args.canopy_height}")
 else:
-    print(f"   Canopy       : not included  (11-band stack)")
-print(f"   Patch size   : {args.patch}px  stride={args.stride}")
-print(f"   min_pos_px   : {args.min_pos_px}")
+    print(f"   Canopy        : not included  (11-band stack)")
+print(f"   Patch size    : {args.patch}px  stride={args.stride}")
+print(f"   min_pos_px    : {args.min_pos_px}")
 print(f"   pos_oversample: {args.pos_oversample}x")
-print(f"   Epochs       : {args.epochs}  batch={args.batch}  lr={args.lr}")
-print(f"   Outputs in   : outputs/{args.aoi}_{args.year}_*")
+print(f"   Epochs        : {args.epochs}  batch={args.batch}  lr={args.lr}")
+print(f"   Outputs in    : outputs/{args.aoi}_{args.year}_*")
 print(f"{'='*65}")
