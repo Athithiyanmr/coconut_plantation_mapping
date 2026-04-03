@@ -1,272 +1,169 @@
-# scripts/evaluate_iou.py
-
 import argparse
-import logging
+import csv
 import json
+import logging
 from pathlib import Path
 
 import numpy as np
 import rasterio
 from rasterio.warp import reproject, Resampling
-import matplotlib
-matplotlib.use("Agg")
-import matplotlib.pyplot as plt
-import matplotlib.patches as mpatches
 
-# -----------------------------------------
-# LOGGING
-# -----------------------------------------
-logging.basicConfig(
-    filename="evaluate.log",
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s",
-)
+logging.basicConfig(filename="evaluate.log", level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger(__name__)
 
-# -----------------------------------------
-# ARGUMENTS
-# -----------------------------------------
-parser = argparse.ArgumentParser(description="Evaluate coconut plantation prediction against ground truth")
-parser.add_argument("--year",      required=True)
-parser.add_argument("--aoi",       required=True)
-parser.add_argument("--threshold", type=float, default=None,
-                    help="Fixed threshold. If omitted -> auto-search over [0.1, 0.9]")
-parser.add_argument("--t_min",     type=float, default=0.1,  help="Auto-search min threshold (default: 0.1)")
-parser.add_argument("--t_max",     type=float, default=0.9,  help="Auto-search max threshold (default: 0.9)")
-parser.add_argument("--t_step",    type=float, default=0.05, help="Auto-search step (default: 0.05)")
+parser = argparse.ArgumentParser(description="Evaluate coconut prediction against ground truth")
+parser.add_argument("--year",        required=True)
+parser.add_argument("--aoi",         required=True)
+parser.add_argument("--threshold",   type=float, default=None,
+                    help="Fixed threshold. If omitted, auto-search best threshold.")
+parser.add_argument("--t_min",       type=float, default=0.20)
+parser.add_argument("--t_max",       type=float, default=0.80)
+parser.add_argument("--t_step",      type=float, default=0.02)
+parser.add_argument("--t_fine_step", type=float, default=0.005)
+parser.add_argument("--metric",      choices=["f1", "iou"], default="f1")
 args = parser.parse_args()
 
 YEAR      = args.year
 AOI       = args.aoi
-THRESHOLD = args.threshold
+FIXED_THR = args.threshold
 
-# -----------------------------------------
-# PATHS
-# -----------------------------------------
-PRED      = Path(f"outputs/unet/{YEAR}/coconut_prob_{YEAR}_{AOI}.tif")
-LABEL     = Path(f"data/processed/training/labels_coconut_{YEAR}_{AOI}.tif")
-OUT_DIR   = Path(f"outputs/unet/{YEAR}")
+PROB_PATH  = Path(f"outputs/unet/{YEAR}/coconut_prob_{YEAR}_{AOI}.tif")
+LABEL_PATH = Path(f"data/processed/training/labels_coconut_{YEAR}_{AOI}.tif")
+OUT_DIR    = Path(f"outputs/unet/{YEAR}/evaluation")
 OUT_DIR.mkdir(parents=True, exist_ok=True)
+OUT_CSV  = OUT_DIR / f"threshold_search_{YEAR}_{AOI}.csv"
+OUT_JSON = OUT_DIR / f"metrics_{YEAR}_{AOI}.json"
+OUT_CONF = OUT_DIR / f"confusion_{YEAR}_{AOI}.tif"
 
-CONF_PATH = OUT_DIR / f"confusion_{YEAR}_{AOI}.tif"
-PLOT_DIR  = OUT_DIR / "plots"
-PLOT_DIR.mkdir(exist_ok=True)
-
-for p in [PRED, LABEL]:
+for p, name in [(PROB_PATH, "Probability map"), (LABEL_PATH, "Label raster")]:
     if not p.exists():
-        raise FileNotFoundError(f"File not found: {p}")
+        raise FileNotFoundError(f"{name} not found: {p}")
 
-print(f"\nEvaluating: {AOI} {YEAR}")
-log.info(f"Start: AOI={AOI}, year={YEAR}, threshold={THRESHOLD}")
+log.info(f"Start evaluation: AOI={AOI}, year={YEAR}")
 
-# -----------------------------------------
-# LOAD PREDICTION
-# -----------------------------------------
-print("\nLoading prediction...")
-with rasterio.open(PRED) as src:
-    pred = src.read(1).astype("float32")
-    meta = src.meta.copy()
-    H, W = pred.shape
+# LOAD DATA
+print("\nLoading probability map...")
+with rasterio.open(PROB_PATH) as src:
+    prob          = src.read(1).astype("float32")
+    ref_meta      = src.meta.copy()
+    H, W          = src.height, src.width
+    ref_transform = src.transform
+    ref_crs       = src.crs
 
-print(f"   Pred shape : {pred.shape}")
-print(f"   Pred range : [{pred.min():.3f}, {pred.max():.3f}]")
-log.info(f"Pred loaded: shape={pred.shape}, range=[{pred.min():.3f},{pred.max():.3f}]")
-
-# -----------------------------------------
-# ALIGN GROUND TRUTH TO PREDICTION GRID
-# -----------------------------------------
-print("\nAligning ground truth...")
-with rasterio.open(LABEL) as gt_src:
-    gt_aligned = np.zeros((H, W), dtype="uint8")
+print("Loading ground truth labels...")
+label = np.zeros((H, W), dtype="uint8")
+with rasterio.open(LABEL_PATH) as src:
     reproject(
-        source=gt_src.read(1),
-        destination=gt_aligned,
-        src_transform=gt_src.transform,
-        src_crs=gt_src.crs,
-        dst_transform=meta["transform"],
-        dst_crs=meta["crs"],
+        source=src.read(1), destination=label,
+        src_transform=src.transform, src_crs=src.crs,
+        dst_transform=ref_transform, dst_crs=ref_crs,
         resampling=Resampling.nearest,
     )
 
-gt_bin   = gt_aligned > 0
-gt_coconut = gt_bin.sum()
-print(f"   GT coconut pixels : {gt_coconut:,} / {H*W:,} ({100*gt_bin.mean():.2f}%%)")
-log.info(f"GT aligned: coconut={gt_coconut}, total={H*W}")
+label_binary = (label > 0).astype("uint8")
+total_px   = int(H * W)
+coconut_px = int(label_binary.sum())
+print(f"   Coconut px : {coconut_px:,}  ({100*coconut_px/total_px:.2f}%)")
 
-if gt_coconut == 0:
-    raise RuntimeError(
-        "Ground truth is empty after alignment.\n"
-        "Check that prediction and label share the same CRS and spatial extent."
-    )
+if coconut_px == 0:
+    raise RuntimeError("Label mask is entirely zero.")
 
-# -----------------------------------------
-# METRICS HELPER
-# -----------------------------------------
-def calc_metrics(pred_prob, gt, t):
-    pb  = pred_prob > t
-    TP  = np.logical_and( pb,  gt).sum()
-    FP  = np.logical_and( pb, ~gt).sum()
-    FN  = np.logical_and(~pb,  gt).sum()
-    TN  = np.logical_and(~pb, ~gt).sum()
-    precision = TP / (TP + FP + 1e-6)
-    recall    = TP / (TP + FN + 1e-6)
-    f1        = 2 * precision * recall / (precision + recall + 1e-6)
-    iou       = TP / (TP + FP + FN + 1e-6)
-    accuracy  = (TP + TN) / (TP + TN + FP + FN + 1e-6)
-    return dict(
-        threshold=round(float(t), 4),
-        TP=int(TP), FP=int(FP), FN=int(FN), TN=int(TN),
-        precision=round(float(precision), 6),
-        recall=round(float(recall),    6),
-        f1=round(float(f1),        6),
-        iou=round(float(iou),       6),
-        accuracy=round(float(accuracy),  6),
-    )
 
-# -----------------------------------------
-# AUTO THRESHOLD SEARCH
-# -----------------------------------------
-if THRESHOLD is None:
-    print(f"\nSearching best threshold [{args.t_min:.2f} -> {args.t_max:.2f}, step={args.t_step}]...")
-    thresholds  = np.arange(args.t_min, args.t_max + args.t_step, args.t_step)
-    search_results = []
-    best_iou    = 0
-    best_t      = 0.5
+def evaluate_threshold(pred, gt, thresholds):
+    rows = []
+    for thr in thresholds:
+        pred_bin = (pred > thr).astype("uint8")
+        tp = int(((pred_bin == 1) & (gt == 1)).sum())
+        fp = int(((pred_bin == 1) & (gt == 0)).sum())
+        fn = int(((pred_bin == 0) & (gt == 1)).sum())
+        tn = int(((pred_bin == 0) & (gt == 0)).sum())
+        precision = tp / (tp + fp + 1e-6)
+        recall    = tp / (tp + fn + 1e-6)
+        f1  = (2 * tp) / (2 * tp + fp + fn + 1e-6)
+        iou = tp / (tp + fp + fn + 1e-6)
+        accuracy  = (tp + tn) / (tp + fp + fn + tn + 1e-6)
+        rows.append({"threshold": round(float(thr), 6), "tp": tp, "fp": fp, "fn": fn, "tn": tn,
+                      "precision": round(precision, 6), "recall": round(recall, 6),
+                      "f1": round(f1, 6), "iou": round(iou, 6), "accuracy": round(accuracy, 6)})
+    return rows
 
-    for t in thresholds:
-        m = calc_metrics(pred, gt_bin, t)
-        print(f"   t={t:.2f} -> IoU={m['iou']:.4f}  F1={m['f1']:.4f}  "
-              f"P={m['precision']:.4f}  R={m['recall']:.4f}")
-        search_results.append(m)
-        if m["iou"] > best_iou:
-            best_iou = m["iou"]
-            best_t   = t
+def pick_best(rows, metric):
+    if metric == "f1":
+        return max(rows, key=lambda r: (r["f1"], r["iou"]))
+    return max(rows, key=lambda r: (r["iou"], r["f1"]))
 
-    THRESHOLD = float(best_t)
-    print(f"\n   Best threshold: {THRESHOLD:.2f}  (IoU={best_iou:.4f})")
-    log.info(f"Auto threshold: best_t={THRESHOLD}, best_iou={best_iou:.4f}")
 
-    # -----------------------------------------
-    # IoU + F1 vs Threshold Plot
-    # -----------------------------------------
-    iou_vals = [r["iou"] for r in search_results]
-    f1_vals  = [r["f1"]  for r in search_results]
-    t_vals   = [r["threshold"] for r in search_results]
+# THRESHOLD SEARCH
+if FIXED_THR is not None:
+    print(f"\nUsing fixed threshold: {FIXED_THR}")
+    all_rows = evaluate_threshold(prob, label_binary, [FIXED_THR])
+    best_row = all_rows[0]
+else:
+    print(f"\nThreshold search: [{args.t_min}, {args.t_max}]")
+    coarse = np.arange(args.t_min, args.t_max + 1e-9, args.t_step, dtype=float)
+    coarse_rows = evaluate_threshold(prob, label_binary, coarse)
+    best_coarse = pick_best(coarse_rows, args.metric)
+    print(f"   Coarse best : thr={best_coarse['threshold']:.3f}  F1={best_coarse['f1']:.4f}  IoU={best_coarse['iou']:.4f}")
 
-    fig, ax1 = plt.subplots(figsize=(8, 4))
-    ax1.plot(t_vals, iou_vals, "b-o", label="IoU")
-    ax1.plot(t_vals, f1_vals,  "g-s", label="F1")
-    ax1.axvline(THRESHOLD, color="red", linestyle="--", label=f"Best t={THRESHOLD:.2f}")
-    ax1.set_xlabel("Threshold")
-    ax1.set_ylabel("Score")
-    ax1.set_title(f"IoU & F1 vs Threshold -- {AOI} {YEAR}")
-    ax1.legend()
-    ax1.grid(True, alpha=0.3)
-    plt.tight_layout()
-    iou_plot = PLOT_DIR / f"threshold_search_{YEAR}_{AOI}.png"
-    plt.savefig(iou_plot, dpi=150)
-    plt.close()
-    print(f"   Threshold plot saved -> {iou_plot}")
+    margin  = max(args.t_step, 0.05)
+    fine_lo = max(args.t_min, best_coarse["threshold"] - margin)
+    fine_hi = min(args.t_max, best_coarse["threshold"] + margin)
+    fine    = np.arange(fine_lo, fine_hi + 1e-9, args.t_fine_step, dtype=float)
+    fine    = np.unique(np.clip(fine, args.t_min, args.t_max))
+    fine_rows = evaluate_threshold(prob, label_binary, fine)
+    best_row  = pick_best(fine_rows, args.metric)
+    all_rows  = sorted(coarse_rows + fine_rows, key=lambda r: r["threshold"])
+    print(f"   Fine best   : thr={best_row['threshold']:.3f}  F1={best_row['f1']:.4f}  IoU={best_row['iou']:.4f}")
 
-# -----------------------------------------
-# FINAL METRICS AT CHOSEN THRESHOLD
-# -----------------------------------------
-m = calc_metrics(pred, gt_bin, THRESHOLD)
+BEST_THR = best_row["threshold"]
+log.info(f"Best threshold: {BEST_THR}, F1={best_row['f1']}, IoU={best_row['iou']}")
 
-print(f"\n{'='*45}")
-print(f"METRICS -- {AOI} {YEAR}  (t={THRESHOLD:.2f})")
-print(f"{'='*45}")
-print(f"   Accuracy  : {m['accuracy']:.4f}")
-print(f"   Precision : {m['precision']:.4f}")
-print(f"   Recall    : {m['recall']:.4f}")
-print(f"   F1 Score  : {m['f1']:.4f}")
-print(f"   IoU       : {m['iou']:.4f}")
-print(f"{'='*45}")
-print(f"   TP: {m['TP']:,}  FP: {m['FP']:,}")
-print(f"   FN: {m['FN']:,}  TN: {m['TN']:,}")
-log.info(f"Metrics: {m}")
+# SAVE CSV
+with open(OUT_CSV, "w", newline="") as f:
+    writer = csv.DictWriter(f, fieldnames=all_rows[0].keys())
+    writer.writeheader()
+    writer.writerows(all_rows)
+print(f"\nThreshold CSV -> {OUT_CSV}  ({len(all_rows)} rows)")
 
-# Save metrics to JSON
-metrics_path = OUT_DIR / f"metrics_{YEAR}_{AOI}.json"
-with open(metrics_path, "w") as f:
-    json.dump(m, f, indent=2)
-print(f"\nMetrics saved -> {metrics_path}")
-log.info(f"Metrics saved: {metrics_path}")
+# SAVE JSON
+metrics = {
+    "year": YEAR, "aoi": AOI, "best_threshold": BEST_THR,
+    "iou": best_row["iou"], "f1": best_row["f1"],
+    "precision": best_row["precision"], "recall": best_row["recall"],
+    "accuracy": best_row["accuracy"],
+    "tp": best_row["tp"], "fp": best_row["fp"],
+    "fn": best_row["fn"], "tn": best_row["tn"],
+    "total_pixels": total_px, "coconut_pixels": coconut_px,
+    "threshold_metric": args.metric,
+}
+with open(OUT_JSON, "w") as f:
+    json.dump(metrics, f, indent=2)
+print(f"Metrics JSON  -> {OUT_JSON}")
 
-# -----------------------------------------
-# CONFUSION MAP RASTER
-# 0=TN  1=FP  2=FN  3=TP
-# -----------------------------------------
-pred_bin = pred > THRESHOLD
-conf     = np.zeros((H, W), dtype="uint8")
-conf[np.logical_and( pred_bin, ~gt_bin)] = 1   # FP
-conf[np.logical_and(~pred_bin,  gt_bin)] = 2   # FN
-conf[np.logical_and( pred_bin,  gt_bin)] = 3   # TP
+# CONFUSION RASTER (TP=1, FP=2, FN=3, TN=0)
+pred_bin  = (prob > BEST_THR).astype("uint8")
+confusion = np.zeros((H, W), dtype="uint8")
+confusion[(pred_bin == 1) & (label_binary == 1)] = 1
+confusion[(pred_bin == 1) & (label_binary == 0)] = 2
+confusion[(pred_bin == 0) & (label_binary == 1)] = 3
 
-meta.update(
-    count=1,
-    dtype="uint8",
-    nodata=255,
-    compress="lzw",
-    tiled=True,
-    blockxsize=256,
-    blockysize=256,
-)
-with rasterio.open(CONF_PATH, "w", **meta) as dst:
-    dst.write(conf, 1)
-    dst.update_tags(
-        legend="0=TN 1=FP 2=FN 3=TP",
-        threshold=str(THRESHOLD),
-        aoi=AOI,
-        year=YEAR,
-    )
-print(f"Confusion raster -> {CONF_PATH}")
-log.info(f"Confusion raster saved: {CONF_PATH}")
+conf_meta = ref_meta.copy()
+conf_meta.update(count=1, dtype="uint8", nodata=255, compress="lzw")
+with rasterio.open(OUT_CONF, "w", **conf_meta) as dst:
+    dst.write(confusion, 1)
+    dst.update_tags(description="Confusion: 0=TN, 1=TP, 2=FP, 3=FN", threshold=str(BEST_THR))
+    dst.update_tags(1, CLASS_0="TN", CLASS_1="TP", CLASS_2="FP", CLASS_3="FN")
+print(f"Confusion map -> {OUT_CONF}")
 
-# -----------------------------------------
-# CONFUSION MAP VISUAL
-# -----------------------------------------
-cmap   = plt.cm.colors.ListedColormap(["#d3d3d3", "#e74c3c", "#3498db", "#2ecc71"])
-labels = ["TN (correct background)", "FP (false coconut)",
-          "FN (missed coconut)",     "TP (correct coconut)"]
-patches = [mpatches.Patch(color=c, label=l)
-           for c, l in zip(["#d3d3d3","#e74c3c","#3498db","#2ecc71"], labels)]
-
-fig, ax = plt.subplots(figsize=(10, 10))
-ax.imshow(conf, cmap=cmap, vmin=0, vmax=3, interpolation="none")
-ax.legend(handles=patches, loc="lower right", fontsize=9)
-ax.set_title(f"Confusion Map -- {AOI} {YEAR}  (t={THRESHOLD:.2f})", fontsize=12)
-ax.axis("off")
-plt.tight_layout()
-conf_png = PLOT_DIR / f"confusion_map_{YEAR}_{AOI}.png"
-plt.savefig(conf_png, dpi=150, bbox_inches="tight")
-plt.close()
-print(f"Confusion map PNG -> {conf_png}")
-
-# -----------------------------------------
-# PROBABILITY HISTOGRAM
-# -----------------------------------------
-fig, ax = plt.subplots(figsize=(8, 4))
-ax.hist(pred.flatten(), bins=100, color="steelblue", edgecolor="none", alpha=0.8)
-ax.axvline(THRESHOLD, color="red", linestyle="--", linewidth=1.5, label=f"t={THRESHOLD:.2f}")
-ax.set_title(f"Prediction Probability Distribution -- {AOI} {YEAR}")
-ax.set_xlabel("Probability")
-ax.set_ylabel("Pixel count")
-ax.legend()
-ax.grid(True, alpha=0.3)
-plt.tight_layout()
-hist_png = PLOT_DIR / f"prob_histogram_{YEAR}_{AOI}.png"
-plt.savefig(hist_png, dpi=150)
-plt.close()
-print(f"Histogram PNG -> {hist_png}")
-
-# -----------------------------------------
-# FINAL OUTPUT SUMMARY
-# -----------------------------------------
-print(f"\n{'='*45}")
-print(f"Evaluation complete : {AOI} {YEAR}")
-print(f"   Metrics  : {metrics_path}")
-print(f"   Conf TIF : {CONF_PATH}")
-print(f"   Conf PNG : {conf_png}")
-print(f"   Histogram: {hist_png}")
-print(f"{'='*45}")
+# FINAL REPORT
+print(f"\n{'='*55}")
+print(f"Evaluation : {AOI} {YEAR}")
+print(f"   Threshold : {BEST_THR:.4f}")
+print(f"   IoU       : {best_row['iou']:.4f}")
+print(f"   F1        : {best_row['f1']:.4f}")
+print(f"   Precision : {best_row['precision']:.4f}")
+print(f"   Recall    : {best_row['recall']:.4f}")
+print(f"   Accuracy  : {best_row['accuracy']:.4f}")
+print(f"   TP: {best_row['tp']:>10,}  |  FP: {best_row['fp']:>10,}")
+print(f"   FN: {best_row['fn']:>10,}  |  TN: {best_row['tn']:>10,}")
+print(f"{'='*55}")

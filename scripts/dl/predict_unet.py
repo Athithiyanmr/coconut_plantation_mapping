@@ -1,284 +1,234 @@
-# scripts/dl/predict_unet.py
-
-import os
-os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
-
 import argparse
+import json
 import logging
+import shutil
 from pathlib import Path
 
 import numpy as np
 import rasterio
-import torch
+from rasterio.warp import reproject, Resampling
+from scipy.ndimage import binary_dilation
 from tqdm import tqdm
 
-from scripts.dl.unet_transformer import UNetTransformer
-
-# -----------------------------------------
-# LOGGING
-# -----------------------------------------
 logging.basicConfig(
-    filename="predict.log",
+    filename="make_patches.log",
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
 )
 log = logging.getLogger(__name__)
 
-# -----------------------------------------
-# ARGUMENTS
-# -----------------------------------------
-parser = argparse.ArgumentParser(description="Sliding-window inference for coconut plantation mapping")
-parser.add_argument("--year",        required=True)
-parser.add_argument("--aoi",         required=True)
-parser.add_argument("--threshold",   type=float, default=0.35,  help="Binarization threshold (default: 0.35)")
-parser.add_argument("--patch",       type=int,   default=128,   help="Patch size -- must match training (default: 128)")
-parser.add_argument("--stride",      type=int,   default=64,    help="Sliding window stride (default: 64)")
-parser.add_argument("--in_channels", type=int,   default=11,    help="Input bands -- must match training (default: 11)")
-parser.add_argument("--batch_size",  type=int,   default=16,    help="Patches per inference batch (default: 16)")
-parser.add_argument("--no_binary",   action="store_true",       help="Skip binary output, save probability only")
+parser = argparse.ArgumentParser(description="Generate image/mask patch pairs for DL training")
+parser.add_argument("--year",       required=True)
+parser.add_argument("--aoi",        required=True)
+parser.add_argument("--patch",      type=int,   default=128,  help="Patch size in pixels (default: 128)")
+parser.add_argument("--stride",     type=int,   default=64,   help="Stride between patches (default: 64)")
+parser.add_argument("--pos_ratio",  type=float, default=0.02, help="Min coconut ratio to keep as positive patch")
+parser.add_argument("--neg_sample", type=float, default=0.25, help="Keep probability for background patches")
+parser.add_argument("--dilate",     type=int,   default=1,    help="Dilation iterations on label mask (0=off)")
+parser.add_argument("--seed",       type=int,   default=42,   help="Random seed")
+parser.add_argument("--clean",      action="store_true",      help="Delete old patches before running")
 args = parser.parse_args()
 
 YEAR       = args.year
 AOI        = args.aoi
-THRESHOLD  = args.threshold
 PATCH      = args.patch
 STRIDE     = args.stride
-IN_CH      = args.in_channels
-BATCH_SIZE = args.batch_size
+POS_RATIO  = args.pos_ratio
+NEG_SAMPLE = args.neg_sample
+SEED       = args.seed
 
-# -----------------------------------------
-# PATHS
-# -----------------------------------------
-STACK     = Path(f"data/processed/{AOI}/stack_{YEAR}.tif")
-MODEL     = Path(f"models/unet_{YEAR}_{AOI}_best.pth")
+np.random.seed(SEED)
 
-OUT_DIR   = Path(f"outputs/unet/{YEAR}")
-OUT_DIR.mkdir(parents=True, exist_ok=True)
+STACK = f"data/processed/{AOI}/stack_{YEAR}.tif"
+LABEL = f"data/processed/training/labels_coconut_{YEAR}_{AOI}.tif"
 
-OUT_PROB  = OUT_DIR / f"coconut_prob_{YEAR}_{AOI}.tif"
-OUT_BIN   = OUT_DIR / f"coconut_binary_{YEAR}_{AOI}.tif"
+OUT_BASE = Path(f"data/dl/{YEAR}_{AOI}")
+OUT_IMG  = OUT_BASE / "images"
+OUT_MSK  = OUT_BASE / "masks"
+CFG_PATH = OUT_BASE / "patch_config.json"
 
-# -----------------------------------------
-# VALIDATE INPUTS
-# -----------------------------------------
-if not STACK.exists():
-    raise FileNotFoundError(f"Stack not found: {STACK}\nRun 02_build_stack.py first.")
-if not MODEL.exists():
-    raise FileNotFoundError(
-        f"Model checkpoint not found: {MODEL}\n"
-        "Run train_unet.py first, or check --year/--aoi match the saved model."
-    )
+if args.clean:
+    print("Cleaning old patches...")
+    shutil.rmtree(OUT_BASE, ignore_errors=True)
+    log.info("Cleaned old patch directory")
 
-log.info(f"Start: AOI={AOI}, year={YEAR}, patch={PATCH}, stride={STRIDE}, threshold={THRESHOLD}")
+OUT_IMG.mkdir(parents=True, exist_ok=True)
+OUT_MSK.mkdir(parents=True, exist_ok=True)
 
-# -----------------------------------------
-# DEVICE
-# -----------------------------------------
-device = (
-    torch.device("mps")  if torch.backends.mps.is_available()  else
-    torch.device("cuda") if torch.cuda.is_available()           else
-    torch.device("cpu")
+log.info(
+    f"Start: AOI={AOI}, year={YEAR}, patch={PATCH}, stride={STRIDE}, "
+    f"pos_ratio={POS_RATIO}, neg_sample={NEG_SAMPLE}, seed={SEED}"
 )
-print(f"Device : {device}")
-log.info(f"Device: {device}")
 
-# -----------------------------------------
-# LOAD STACK
-# -----------------------------------------
+# STEP 1 -- LOAD STACK (auto-detect band count)
 print("\nLoading stack...")
+if not Path(STACK).exists():
+    raise FileNotFoundError(f"Stack not found: {STACK}\nRun 02_build_stack.py first.")
+
 with rasterio.open(STACK) as src:
-    img    = src.read().astype("float32")
-    meta   = src.meta.copy()
-    H, W   = src.height, src.width
-    nodata = src.nodata
+    img      = src.read().astype("float32")
+    ref_meta = src.meta.copy()
+    H, W     = src.height, src.width
+    nodata   = src.nodata
+    band_names = []
+    for i in range(1, src.count + 1):
+        tags = src.tags(i)
+        band_names.append(tags.get("name", f"band_{i}"))
 
-bands = img.shape[0]
-print(f"   Shape  : {img.shape}  (bands x H x W)")
-print(f"   Nodata : {nodata}")
-log.info(f"Stack loaded: shape={img.shape}")
+n_bands = img.shape[0]
+print(f"   Stack shape : {img.shape}  (bands x H x W)")
+print(f"   Bands ({n_bands}): {band_names}")
+log.info(f"Stack loaded: shape={img.shape}, nodata={nodata}, bands={band_names}")
 
-# Nodata -> NaN, then per-band z-score
+# STEP 2 -- NODATA -> NaN
 if nodata is not None:
     img[img == nodata] = np.nan
 
+# STEP 3 -- PER-BAND NORMALISATION (z-score on valid pixels)
 print("Normalising bands...")
-for b in range(img.shape[0]):
+band_stats = []
+for b in range(n_bands):
     band  = img[b]
     valid = band[~np.isnan(band)]
     if valid.size == 0:
+        band_stats.append({"band": band_names[b], "mean": None, "std": None})
         continue
-    mu, sigma = valid.mean(), valid.std()
+    mu, sigma = float(valid.mean()), float(valid.std())
     if sigma > 0:
         img[b] = (band - mu) / sigma
+    band_stats.append({"band": band_names[b], "mean": mu, "std": sigma})
+    log.info(f"Band {b} ({band_names[b]}): mean={mu:.4f}, std={sigma:.4f}")
 
-img = np.nan_to_num(img, nan=0.0)
-
-# -----------------------------------------
-# LOAD MODEL
-# -----------------------------------------
-print("\nLoading model...")
-checkpoint = torch.load(MODEL, map_location=device)
-
-# Support both full checkpoint dict and raw state_dict
-if isinstance(checkpoint, dict) and "model_state" in checkpoint:
-    state_dict  = checkpoint["model_state"]
-    saved_cfg   = checkpoint.get("config", {})
-    saved_ch    = saved_cfg.get("in_channels", IN_CH)
-    saved_thr   = saved_cfg.get("threshold",   THRESHOLD)
-
-    if saved_ch != IN_CH:
-        print(f"   Checkpoint in_channels={saved_ch} -- overriding --in_channels {IN_CH}")
-        IN_CH = saved_ch
-
-    if args.threshold == 0.35 and saved_thr != 0.35:
-        print(f"   Using saved threshold: {saved_thr}")
-        THRESHOLD = saved_thr
-else:
-    state_dict = checkpoint
-
-model = UNetTransformer(in_channels=IN_CH).to(device)
-model.load_state_dict(state_dict)
-model.eval()
-torch.set_grad_enabled(False)
-
-total_params = sum(p.numel() for p in model.parameters())
-print(f"   Parameters : {total_params:,}")
-print(f"   In channels: {IN_CH}")
-print(f"   Threshold  : {THRESHOLD}")
-log.info(f"Model loaded: in_channels={IN_CH}, threshold={THRESHOLD}")
-
-# -----------------------------------------
-# PADDING (reflect -- avoids border artifacts)
-# -----------------------------------------
-pad_h = (PATCH - H % PATCH) % PATCH
-pad_w = (PATCH - W % PATCH) % PATCH
-
-if pad_h > 0 or pad_w > 0:
-    img = np.pad(img, ((0, 0), (0, pad_h), (0, pad_w)), mode="reflect")
-    print(f"\nPadded: {H}x{W} -> {img.shape[1]}x{img.shape[2]}")
-
-H_pad, W_pad = img.shape[1], img.shape[2]
-
-# -----------------------------------------
-# OUTPUT ACCUMULATORS
-# -----------------------------------------
-pred_sum = np.zeros((H_pad, W_pad), dtype="float32")
-pred_cnt = np.zeros((H_pad, W_pad), dtype="float32")
-
-# Pre-collect all patch coordinates
-coords = [
-    (i, j)
-    for i in range(0, H_pad - PATCH + 1, STRIDE)
-    for j in range(0, W_pad - PATCH + 1, STRIDE)
-]
-
-total_patches = len(coords)
-print(f"\nSliding window inference")
-print(f"   Patch    : {PATCH}x{PATCH}  |  Stride : {STRIDE}")
-print(f"   Patches  : {total_patches:,}  |  Batch  : {BATCH_SIZE}")
-log.info(f"Inference: patches={total_patches}, batch={BATCH_SIZE}")
-
-# -----------------------------------------
-# BATCHED INFERENCE
-# -----------------------------------------
-for batch_start in tqdm(range(0, total_patches, BATCH_SIZE), desc="Inference", unit="batch"):
-
-    batch_coords = coords[batch_start: batch_start + BATCH_SIZE]
-    batch_patches = []
-    valid_coords  = []
-
-    for (i, j) in batch_coords:
-        patch = img[:, i:i+PATCH, j:j+PATCH]
-        if np.isnan(patch).any() or patch.shape[1:] != (PATCH, PATCH):
-            continue
-        batch_patches.append(patch)
-        valid_coords.append((i, j))
-
-    if not batch_patches:
-        continue
-
-    x    = torch.from_numpy(np.stack(batch_patches)).to(device)
-    pred = torch.sigmoid(model(x)).squeeze(1).cpu().numpy()
-
-    for idx, (i, j) in enumerate(valid_coords):
-        pred_sum[i:i+PATCH, j:j+PATCH] += pred[idx]
-        pred_cnt[i:i+PATCH, j:j+PATCH] += 1
-
-# -----------------------------------------
-# AVERAGE OVERLAPPING PREDICTIONS
-# -----------------------------------------
-pred_final = np.divide(
-    pred_sum, pred_cnt,
-    out=np.zeros_like(pred_sum),
-    where=pred_cnt > 0,
-)
-
-pred_final = pred_final[:H, :W]
-
-covered = (pred_cnt[:H, :W] > 0).mean() * 100
-print(f"\n   Coverage : {covered:.1f}%% of pixels predicted")
-log.info(f"Coverage: {covered:.1f}%%")
-
-# -----------------------------------------
-# SAVE PROBABILITY MAP
-# -----------------------------------------
-meta.update(
-    count=1,
-    dtype="float32",
-    nodata=0,
-    compress="lzw",
-    tiled=True,
-    blockxsize=256,
-    blockysize=256,
-)
-
-with rasterio.open(OUT_PROB, "w", **meta) as dst:
-    dst.write(pred_final, 1)
-    dst.update_tags(
-        model=str(MODEL),
-        year=YEAR,
-        aoi=AOI,
-        patch=str(PATCH),
-        stride=str(STRIDE),
-        threshold=str(THRESHOLD),
+# STEP 4 -- LOAD & ALIGN LABEL MASK
+print("\nLoading labels...")
+if not Path(LABEL).exists():
+    raise FileNotFoundError(
+        f"Label mask not found: {LABEL}\n"
+        "Run 03_download_coconut_labels.py first."
     )
 
-prob_mb = OUT_PROB.stat().st_size / 1_000_000
-print(f"\nProbability map  -> {OUT_PROB} ({prob_mb:.1f} MB)")
-log.info(f"Prob saved: {OUT_PROB}, size={prob_mb:.1f}MB")
+label_mask = np.zeros((H, W), dtype="uint8")
 
-# -----------------------------------------
-# BINARY OUTPUT
-# -----------------------------------------
-if not args.no_binary:
-    binary = (pred_final > THRESHOLD).astype("uint8")
-    coconut_px = int(binary.sum())
-    total  = H * W
-    pct    = 100 * coconut_px / total
+with rasterio.open(LABEL) as src:
+    reproject(
+        source=src.read(1),
+        destination=label_mask,
+        src_transform=src.transform,
+        src_crs=src.crs,
+        dst_transform=ref_meta["transform"],
+        dst_crs=ref_meta["crs"],
+        resampling=Resampling.nearest,
+    )
 
-    meta.update(dtype="uint8", nodata=0)
+coconut_total = int(label_mask.sum())
+print(f"   Labels aligned : {label_mask.shape}")
+print(f"   Coconut pixels : {coconut_total:,} / {H*W:,} ({100*label_mask.mean():.2f}%)")
+log.info(f"Label aligned: coconut={coconut_total}, total={H*W}")
 
-    with rasterio.open(OUT_BIN, "w", **meta) as dst:
-        dst.write(binary, 1)
-        dst.update_tags(
-            threshold=str(THRESHOLD),
-            coconut_pixels=str(coconut_px),
-            coconut_pct=f"{pct:.2f}",
-        )
+if coconut_total == 0:
+    raise RuntimeError(
+        "Label mask is empty (all zeros).\n"
+        "Check that label and stack share the same CRS and spatial extent."
+    )
 
-    bin_mb = OUT_BIN.stat().st_size / 1_000_000
-    print(f"Binary map       -> {OUT_BIN} ({bin_mb:.1f} MB)")
-    print(f"   Coconut pixels: {coconut_px:,} / {total:,} ({pct:.2f}%%)")
-    log.info(f"Binary saved: {OUT_BIN}, coconut={coconut_px}, pct={pct:.2f}%%")
+# STEP 5 -- EDGE DILATION
+if args.dilate > 0:
+    print(f"   Dilating mask ({args.dilate} iteration(s))...")
+    label_mask = binary_dilation(label_mask, iterations=args.dilate).astype("uint8")
+    log.info(f"Dilation: iterations={args.dilate}")
 
-# -----------------------------------------
-# FINAL SUMMARY
-# -----------------------------------------
-print(f"\n{'='*55}")
-print(f"Prediction complete : {AOI} {YEAR}")
-print(f"   Probability map : {OUT_PROB}")
-if not args.no_binary:
-    print(f"   Binary map      : {OUT_BIN}")
-    print(f"   Coconut area    : {pct:.2f}%% of AOI")
-print(f"{'='*55}")
-log.info(f"Prediction complete: AOI={AOI}, year={YEAR}")
+# STEP 6 -- PATCH GENERATION
+total_count    = 0
+coconut_count  = 0
+empty_kept     = 0
+skipped_nodata = 0
+skipped_empty  = 0
+
+rows = list(range(0, H - PATCH + 1, STRIDE))
+cols = list(range(0, W - PATCH + 1, STRIDE))
+total_i = len(rows)
+total_j = len(cols)
+
+print(f"\nPatch config : {PATCH}x{PATCH} px, stride={STRIDE}")
+print(f"   Grid         : {total_i} x {total_j} = {total_i * total_j:,} candidates")
+print(f"   Pos ratio    : >= {POS_RATIO*100:.1f}% coconut -> always keep")
+print(f"   Neg sample   : {NEG_SAMPLE*100:.0f}% of background patches kept")
+
+pbar = tqdm(total=total_i * total_j, unit="patch")
+
+for i in rows:
+    for j in cols:
+        pbar.update(1)
+        x = img[:, i:i+PATCH, j:j+PATCH]
+        y = label_mask[i:i+PATCH, j:j+PATCH]
+
+        if x.shape[1:] != (PATCH, PATCH):
+            continue
+
+        nan_ratio = float(np.isnan(x).mean())
+        if nan_ratio > 0.10:
+            skipped_nodata += 1
+            continue
+
+        x = np.nan_to_num(x, nan=0.0)
+        coconut_ratio = float(y.sum() / (PATCH * PATCH))
+
+        if coconut_ratio >= POS_RATIO:
+            coconut_count += 1
+        else:
+            if np.random.rand() >= NEG_SAMPLE:
+                skipped_empty += 1
+                continue
+            empty_kept += 1
+
+        np.save(OUT_IMG / f"img_{total_count:06d}.npy",  x.astype("float32"))
+        np.save(OUT_MSK / f"mask_{total_count:06d}.npy", y.astype("uint8"))
+        total_count += 1
+
+pbar.close()
+
+# STEP 7 -- SUMMARY + SAVE CONFIG
+pos_pct = 100 * coconut_count / max(total_count, 1)
+neg_pct = 100 * empty_kept     / max(total_count, 1)
+
+print(f"\n{'='*52}")
+print("Patch generation complete")
+print(f"   Total saved       : {total_count:,}")
+print(f"   Coconut patches   : {coconut_count:,}  ({pos_pct:.1f}%)")
+print(f"   Empty kept        : {empty_kept:,}  ({neg_pct:.1f}%)")
+print(f"   Skipped (nodata)  : {skipped_nodata:,}")
+print(f"   Skipped (empty)   : {skipped_empty:,}")
+print(f"   Output            : {OUT_BASE}")
+print(f"{'='*52}")
+log.info(
+    f"Done: total={total_count}, coconut={coconut_count}, "
+    f"empty_kept={empty_kept}, nodata_skip={skipped_nodata}, empty_skip={skipped_empty}"
+)
+
+patch_meta = {
+    "year": YEAR,
+    "aoi": AOI,
+    "stack": STACK,
+    "label": LABEL,
+    "patch": PATCH,
+    "stride": STRIDE,
+    "bands": band_names,
+    "n_bands": n_bands,
+    "pos_ratio": POS_RATIO,
+    "neg_sample": NEG_SAMPLE,
+    "dilate": args.dilate,
+    "seed": SEED,
+    "total_candidates": total_i * total_j,
+    "total_saved": total_count,
+    "coconut_patches": coconut_count,
+    "empty_kept": empty_kept,
+    "skipped_nodata": skipped_nodata,
+    "skipped_empty": skipped_empty,
+    "band_stats": band_stats,
+}
+
+with open(CFG_PATH, "w") as f:
+    json.dump(patch_meta, f, indent=2)
+
+print(f"Patch config saved -> {CFG_PATH}")
+log.info(f"Patch config saved: {CFG_PATH}")
