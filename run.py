@@ -3,15 +3,18 @@
 # Usage (11-band, no canopy height):
 #   python run.py --year 2022 --aoi puducherry
 #
-# Usage (12-band, WITH canopy height):
+# Usage (12-band, TN-wide mosaic — RECOMMENDED):
+#   # Download once for all TN districts:
+#   python scripts/00_download_canopy_height_tn.py
+#
+#   # Then run any district:
+#   python run.py --year 2022 --aoi puducherry  --canopy_tn
+#   python run.py --year 2022 --aoi dindigul    --canopy_tn
+#   python run.py --year 2022 --aoi coimbatore  --canopy_tn
+#
+# Usage (12-band, AOI-specific file):
 #   python run.py --year 2022 --aoi puducherry \
 #       --canopy_height data/raw/canopy_height_puducherry.tif
-#
-# WRI/Meta canopy height download options:
-#   GEE : ee.ImageCollection('projects/sat-io/open-datasets/facebook/meta-canopy-height')
-#   AWS : aws s3 cp --no-sign-request \
-#           s3://dataforgood-fb-data/forests/v1/alsgedi_global_v6_float/ . --recursive
-#   Web : https://ai.meta.com/ai-for-good/datasets/canopy-height-maps/
 
 import argparse
 import subprocess
@@ -20,59 +23,70 @@ import sys
 parser = argparse.ArgumentParser(description="Coconut Plantation Mapping Pipeline")
 
 # --- Core ---
-parser.add_argument("--year",           required=True,  help="Year  (e.g. 2022)")
-parser.add_argument("--aoi",            required=True,  help="AOI name (e.g. puducherry)")
+parser.add_argument("--year",           required=True,  help="Year (e.g. 2022)")
+parser.add_argument("--aoi",            required=True,  help="AOI name (e.g. puducherry, dindigul)")
 
-# --- Canopy height (optional) ---
-parser.add_argument("--canopy_height",  default=None,
-                    help="Path to WRI/Meta canopy height GeoTIFF (.tif). "
-                         "When provided, a CanopyHeight_m band is added as Band 12. "
-                         "Coconut palms (15-30 m) are clearly separated from low crops.")
+# --- Canopy height (mutually exclusive) ---
+canopy_group = parser.add_mutually_exclusive_group()
+canopy_group.add_argument(
+    "--canopy_tn",
+    action="store_true",
+    default=False,
+    help=(
+        "Use the TN-wide canopy height mosaic (data/raw/canopy_height_tamilnadu.tif). "
+        "Auto-clips to the AOI boundary at stack-build time. "
+        "Run scripts/00_download_canopy_height_tn.py once before using this flag."
+    ),
+)
+canopy_group.add_argument(
+    "--canopy_height",
+    default=None,
+    metavar="PATH",
+    help="Path to a pre-clipped AOI-specific canopy height GeoTIFF.",
+)
 
 # --- Patches ---
-parser.add_argument("--patch",          type=int,   default=128,   help="Patch size in pixels (default: 128)")
-parser.add_argument("--stride",         type=int,   default=64,    help="Patch stride during training (default: 64)")
-parser.add_argument("--pos_ratio",      type=float, default=0.02,  help="Min coconut ratio for positive patch (default: 0.02)")
-parser.add_argument("--neg_sample",     type=float, default=0.25,  help="Keep rate for background patches (default: 0.25)")
-parser.add_argument("--dilate",         type=int,   default=1,     help="Label dilation iterations (default: 1)")
+parser.add_argument("--patch",          type=int,   default=128)
+parser.add_argument("--stride",         type=int,   default=64)
+parser.add_argument("--pos_ratio",      type=float, default=0.02)
+parser.add_argument("--neg_sample",     type=float, default=0.25)
+parser.add_argument("--dilate",         type=int,   default=1)
 
 # --- Training ---
-parser.add_argument("--epochs",         type=int,   default=40,    help="Training epochs (default: 40)")
-parser.add_argument("--batch",          type=int,   default=8,     help="Batch size (default: 8)")
-parser.add_argument("--lr",             type=float, default=1e-4,  help="Learning rate (default: 1e-4)")
-parser.add_argument("--val_split",      type=float, default=0.2,   help="Validation split (default: 0.2)")
-parser.add_argument("--patience",       type=int,   default=6,     help="Early stopping patience (default: 6)")
+parser.add_argument("--epochs",         type=int,   default=40)
+parser.add_argument("--batch",          type=int,   default=8)
+parser.add_argument("--lr",             type=float, default=1e-4)
+parser.add_argument("--val_split",      type=float, default=0.2)
+parser.add_argument("--patience",       type=int,   default=6)
 
 # --- Threshold search ---
 parser.add_argument("--threshold",      type=float, default=None,
-                    help="Fixed binarisation threshold. If omitted, auto-search optimal threshold.")
-parser.add_argument("--t_min",          type=float, default=0.20,  help="Threshold search min (default: 0.20)")
-parser.add_argument("--t_max",          type=float, default=0.80,  help="Threshold search max (default: 0.80)")
-parser.add_argument("--t_step",         type=float, default=0.02,  help="Coarse threshold step (default: 0.02)")
-parser.add_argument("--t_fine_step",    type=float, default=0.005, help="Fine threshold step (default: 0.005)")
-parser.add_argument("--thr_metric",     choices=["f1", "iou"], default="f1",
-                    help="Metric for threshold selection (default: f1)")
+                    help="Fixed threshold. If omitted, auto-search.")
+parser.add_argument("--t_min",          type=float, default=0.20)
+parser.add_argument("--t_max",          type=float, default=0.80)
+parser.add_argument("--t_step",         type=float, default=0.02)
+parser.add_argument("--t_fine_step",    type=float, default=0.005)
+parser.add_argument("--thr_metric",     choices=["f1", "iou"], default="f1")
 
 # --- Prediction ---
-parser.add_argument("--pred_stride",    type=int,   default=32,    help="Prediction sliding window stride (default: 32)")
-parser.add_argument("--pred_batch",     type=int,   default=8,     help="Prediction batch size (default: 8)")
+parser.add_argument("--pred_stride",    type=int,   default=32)
+parser.add_argument("--pred_batch",     type=int,   default=8)
 
 # --- Workflow control ---
-parser.add_argument("--skip_stack",     action="store_true", help="Skip stack building")
-parser.add_argument("--skip_labels",    action="store_true", help="Skip label download")
-parser.add_argument("--skip_patches",   action="store_true", help="Skip patch generation")
-parser.add_argument("--skip_train",     action="store_true", help="Skip training")
-parser.add_argument("--skip_predict",   action="store_true", help="Skip prediction")
-parser.add_argument("--skip_evaluate",  action="store_true", help="Skip evaluation")
-parser.add_argument("--workers",        type=int,   default=0,     help="DataLoader workers (default: 0)")
-parser.add_argument("--seed",           type=int,   default=42,    help="Random seed (default: 42)")
-parser.add_argument("--clean_patches",  action="store_true", help="Delete old patches before making new ones")
+parser.add_argument("--skip_stack",     action="store_true")
+parser.add_argument("--skip_labels",    action="store_true")
+parser.add_argument("--skip_patches",   action="store_true")
+parser.add_argument("--skip_train",     action="store_true")
+parser.add_argument("--skip_predict",   action="store_true")
+parser.add_argument("--skip_evaluate",  action="store_true")
+parser.add_argument("--workers",        type=int,   default=0)
+parser.add_argument("--seed",           type=int,   default=42)
+parser.add_argument("--clean_patches",  action="store_true")
 
 args = parser.parse_args()
 
 
 def run(cmd):
-    """Run a subprocess command, print it, and exit on failure."""
     print(f"\n{'='*60}")
     print(f"CMD: {' '.join(cmd)}")
     print(f"{'='*60}\n")
@@ -84,7 +98,6 @@ def run(cmd):
 
 # ----------------------------------------------------------
 # STEP 1 -- BUILD STACK
-#   Adds Band 12 (CanopyHeight_m) when --canopy_height is set
 # ----------------------------------------------------------
 if not args.skip_stack:
     cmd = [
@@ -92,13 +105,15 @@ if not args.skip_stack:
         "--year", args.year,
         "--aoi",  args.aoi,
     ]
-    if args.canopy_height:
+    if args.canopy_tn:
+        cmd.append("--canopy_tn")
+    elif args.canopy_height:
         cmd += ["--canopy_height", args.canopy_height]
     run(cmd)
 
 
 # ----------------------------------------------------------
-# STEP 2 -- DOWNLOAD / PREPARE LABELS
+# STEP 2 -- LABELS
 # ----------------------------------------------------------
 if not args.skip_labels:
     run([
@@ -109,9 +124,7 @@ if not args.skip_labels:
 
 
 # ----------------------------------------------------------
-# STEP 3 -- GENERATE PATCHES
-#   make_patches.py auto-detects band count from the stack,
-#   so 11 or 12 bands are handled transparently.
+# STEP 3 -- PATCHES
 # ----------------------------------------------------------
 if not args.skip_patches:
     cmd = [
@@ -132,8 +145,6 @@ if not args.skip_patches:
 
 # ----------------------------------------------------------
 # STEP 4 -- TRAIN
-#   train_unet.py auto-detects in_channels from first patch.
-#   Threshold auto-searched unless --threshold is fixed.
 # ----------------------------------------------------------
 if not args.skip_train:
     cmd = [
@@ -159,8 +170,6 @@ if not args.skip_train:
 
 # ----------------------------------------------------------
 # STEP 5 -- PREDICT
-#   predict_unet.py reads in_channels + best_threshold
-#   automatically from the saved checkpoint.
 # ----------------------------------------------------------
 if not args.skip_predict:
     cmd = [
@@ -199,8 +208,12 @@ if not args.skip_evaluate:
 # ----------------------------------------------------------
 print(f"\n{'='*60}")
 print("PIPELINE COMPLETE")
-print(f"   AOI          : {args.aoi}")
-print(f"   Year         : {args.year}")
-if args.canopy_height:
-    print(f"   Canopy Height: {args.canopy_height}  (Band 12 added)")
+print(f"   AOI    : {args.aoi}")
+print(f"   Year   : {args.year}")
+if args.canopy_tn:
+    print(f"   Canopy : TN mosaic (auto-clipped to {args.aoi})")
+elif args.canopy_height:
+    print(f"   Canopy : {args.canopy_height}")
+else:
+    print(f"   Canopy : not included (11-band stack)")
 print(f"{'='*60}")
