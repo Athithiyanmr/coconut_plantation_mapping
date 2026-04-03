@@ -1,10 +1,11 @@
 # scripts/dl/dataset.py
 #
-# Fix: allow_pickle=True so existing .npy files (saved as object arrays)
-#      load correctly.  np.load returns an ndarray or 0-d object array;
-#      _to_array() unwraps either case into a plain float32/uint8 ndarray.
+# Fix: filter macOS dot-underscore (._*) metadata files from .npy glob.
+#      These are created automatically by macOS on external/network volumes
+#      and are not valid numpy files.
 #
-# New: augment flag, Albumentations pipeline for training.
+# Fix: allow_pickle=True + _to_array() for legacy pickled patches.
+# New: Albumentations augmentation pipeline for training.
 # Install: pip install albumentations
 
 import numpy as np
@@ -36,25 +37,28 @@ def _build_aug():
     ])
 
 
+def _glob_npy(directory):
+    """
+    Return sorted .npy files, skipping macOS dot-underscore metadata files
+    (._filename.npy) written automatically on external / network volumes.
+    """
+    return sorted(
+        p for p in Path(directory).glob("*.npy")
+        if not p.name.startswith("._")
+    )
+
+
 def _to_array(loaded, dtype):
     """
     Safely extract a plain ndarray from a np.load result.
-
-    np.save() with object/dict data creates a 0-d object array:
-        arr.shape == ()  and  arr.dtype == object
-    Calling arr.item() returns the underlying Python object.
-    If the object is already a ndarray we cast directly.
-    If it is a dict (legacy format from some make_patches versions)
-    we attempt to read a sensible value key.
+    Handles 0-d object arrays (pickled ndarrays or dicts).
     """
     arr = loaded
-    # Unwrap 0-d object arrays
     if arr.dtype == object and arr.shape == ():
         inner = arr.item()
         if isinstance(inner, np.ndarray):
             arr = inner
         elif isinstance(inner, dict):
-            # Heuristic: take the first value that is an ndarray
             for v in inner.values():
                 if isinstance(v, np.ndarray):
                     arr = v
@@ -74,8 +78,9 @@ def _to_array(loaded, dtype):
 
 class CoconutDataset(Dataset):
     def __init__(self, img_dir, mask_dir, augment=True):
-        self.imgs  = sorted(Path(img_dir).glob("*.npy"))
-        self.masks = sorted(Path(mask_dir).glob("*.npy"))
+        # _glob_npy skips macOS ._* ghost files automatically
+        self.imgs  = _glob_npy(img_dir)
+        self.masks = _glob_npy(mask_dir)
         self.aug   = _build_aug() if augment else None
 
         if len(self.imgs) != len(self.masks):
@@ -90,46 +95,41 @@ class CoconutDataset(Dataset):
             )
 
         if self.aug:
-            print("[Dataset] Albumentations augmentation enabled")
+            print(f"[Dataset] Augmentation enabled  | {len(self.imgs):,} patches")
         elif augment and not AUG_AVAILABLE:
             print(
                 "[Dataset] WARNING: albumentations not installed -- no augmentation.\n"
                 "          Install with: pip install albumentations"
             )
         else:
-            print("[Dataset] No augmentation (augment=False)")
+            print(f"[Dataset] No augmentation (augment=False)  | {len(self.imgs):,} patches")
 
-        # Probe first file to report any pickle warning once at startup
+        # Probe first file; warn once if saved with pickle
         probe = np.load(self.imgs[0], allow_pickle=True)
         if probe.dtype == object:
             print(
                 "[Dataset] WARNING: .npy files were saved with pickle (object dtype).\n"
-                "          They will load correctly this run, but re-running\n"
-                "          make_patches.py with --clean will write clean files\n"
-                "          and remove this warning."
+                "          They will load correctly this run. Re-run make_patches.py\n"
+                "          with --clean to write clean files and remove this warning."
             )
 
     def __len__(self):
         return len(self.imgs)
 
     def __getitem__(self, idx):
-        # allow_pickle=True handles both clean and legacy pickled files
         x_raw = np.load(self.imgs[idx],  allow_pickle=True)
         y_raw = np.load(self.masks[idx], allow_pickle=True)
 
-        x = _to_array(x_raw, "float32")   # shape: (C, H, W)
-        y = _to_array(y_raw, "float32")   # shape: (H, W)
+        x = _to_array(x_raw, "float32")   # (C, H, W)
+        y = _to_array(y_raw, "float32")   # (H, W)
 
-        # Sanity-check shapes
         if x.ndim != 3:
             raise ValueError(
-                f"Expected image ndim=3 (C,H,W), got {x.ndim} "
-                f"from {self.imgs[idx]}"
+                f"Expected image ndim=3 (C,H,W), got {x.ndim} from {self.imgs[idx]}"
             )
         if y.ndim != 2:
             raise ValueError(
-                f"Expected mask ndim=2 (H,W), got {y.ndim} "
-                f"from {self.masks[idx]}"
+                f"Expected mask ndim=2 (H,W), got {y.ndim} from {self.masks[idx]}"
             )
 
         if self.aug:
