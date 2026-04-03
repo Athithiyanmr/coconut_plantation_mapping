@@ -1,4 +1,10 @@
 # scripts/dl/train_unet.py
+#
+# Changes for 1% coconut class imbalance
+# ----------------------------------------
+# 1. Stratified val split   -- guarantees coconut patches in val set
+# 2. Dynamic pos_weight     -- FocalLoss weights positives by actual batch ratio
+# 3. WeightedRandomSampler  -- positive patches sampled 5x more during training
 
 import os
 os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
@@ -11,7 +17,8 @@ from pathlib import Path
 import numpy as np
 import torch
 from torch import nn, optim
-from torch.utils.data import DataLoader, random_split
+from torch.utils.data import DataLoader, Subset, WeightedRandomSampler
+from sklearn.model_selection import train_test_split
 from tqdm import tqdm
 
 from scripts.dl.dataset import CoconutDataset
@@ -35,6 +42,8 @@ parser.add_argument("--batch",       type=int,   default=8)
 parser.add_argument("--lr",          type=float, default=1e-4)
 parser.add_argument("--val_split",   type=float, default=0.2)
 parser.add_argument("--patience",    type=int,   default=6)
+parser.add_argument("--pos_oversample", type=float, default=5.0,
+                    help="Weight multiplier for positive patches in sampler (default: 5.0)")
 parser.add_argument("--threshold",   type=float, default=None,
                     help="Fixed threshold. If omitted, auto-search on validation set.")
 parser.add_argument("--in_channels", type=int,   default=None,
@@ -104,10 +113,54 @@ if IN_CH != inferred_ch:
         "Re-run make_patches.py with the correct stack."
     )
 
+# -----------------------------------------
+# FIX #1 -- STRATIFIED VAL SPLIT
+# Guarantees coconut patches appear in the val set even at 1% positive rate.
+# Falls back to random split if sklearn is unavailable.
+# -----------------------------------------
 torch.manual_seed(42)
-val_size   = max(1, int(round(len(ds) * VAL_SPLIT)))
-train_size = len(ds) - val_size
-train_ds, val_ds = random_split(ds, [train_size, val_size])
+
+try:
+    # Label each sample: 1 if it contains any coconut pixel, else 0
+    print("Computing per-sample labels for stratified split...")
+    has_coconut = []
+    for i in range(len(ds)):
+        _, m = ds[i]
+        has_coconut.append(int(m.sum() > 0))
+
+    pos_total = sum(has_coconut)
+    neg_total = len(has_coconut) - pos_total
+    print(f"   Positive (coconut) patches : {pos_total:,}  ({100*pos_total/len(has_coconut):.1f}%)")
+    print(f"   Negative (background) patches: {neg_total:,}")
+    log.info(f"Stratified split: pos={pos_total}, neg={neg_total}, total={len(has_coconut)}")
+
+    # Need at least 2 positives to stratify
+    if pos_total >= 2:
+        train_idx, val_idx = train_test_split(
+            range(len(ds)),
+            test_size=VAL_SPLIT,
+            stratify=has_coconut,
+            random_state=42,
+        )
+        train_ds = Subset(ds, list(train_idx))
+        val_ds   = Subset(ds, list(val_idx))
+        train_coconut = sum(has_coconut[i] for i in train_idx)
+        val_coconut   = sum(has_coconut[i] for i in val_idx)
+        print(f"   Stratified split: train={len(train_idx):,} ({train_coconut} pos) "
+              f"| val={len(val_idx):,} ({val_coconut} pos)")
+        log.info(f"Stratified split done: train_pos={train_coconut}, val_pos={val_coconut}")
+    else:
+        raise ValueError(f"Too few positive patches ({pos_total}) for stratified split.")
+
+except Exception as e:
+    print(f"   WARNING: Stratified split failed ({e}). Falling back to random split.")
+    log.warning(f"Stratified split failed: {e}. Using random split.")
+    val_size   = max(1, int(round(len(ds) * VAL_SPLIT)))
+    train_size = len(ds) - val_size
+    from torch.utils.data import random_split as _random_split
+    train_ds, val_ds = _random_split(ds, [train_size, val_size])
+    has_coconut = None
+    train_idx   = None
 
 # -----------------------------------------
 # LOSS FUNCTIONS
@@ -127,16 +180,31 @@ class DiceLoss(nn.Module):
 
 
 class FocalLoss(nn.Module):
-    def __init__(self, alpha=0.8, gamma=3.0):
-        """Focal loss with gamma=3.0 (increased from 2.0 for sparser coconut class)."""
+    """
+    FIX #2 -- DYNAMIC pos_weight
+    Computes pos_weight from actual batch ratio instead of a hardcoded constant.
+    For a 1% positive rate this gives ~99x theoretical weight, clamped to [5, 30]
+    to avoid numerical instability.
+    """
+    def __init__(self, gamma=3.0):
         super().__init__()
-        self.alpha = alpha
         self.gamma = gamma
 
     def forward(self, preds, targets):
-        bce = nn.functional.binary_cross_entropy(preds, targets, reduction="none")
+        # Dynamic weight based on actual batch composition
+        pos_count  = targets.sum() + 1e-6
+        neg_count  = targets.numel() - targets.sum() + 1e-6
+        pos_weight = (neg_count / pos_count).clamp(5.0, 30.0)
+
+        weight = torch.where(
+            targets > 0.5,
+            pos_weight * torch.ones_like(targets),
+            torch.ones_like(targets),
+        )
+        bce = nn.functional.binary_cross_entropy(preds, targets,
+                                                  weight=weight, reduction="none")
         pt  = torch.exp(-bce)
-        return (self.alpha * (1 - pt) ** self.gamma * bce).mean()
+        return ((1 - pt) ** self.gamma * bce).mean()
 
 
 focal_loss = FocalLoss()
@@ -206,13 +274,44 @@ if __name__ == "__main__":
 
     pin = (device.type == "cuda")
 
-    train_dl = DataLoader(
-        train_ds,
-        batch_size=BATCH_SIZE,
-        shuffle=True,
-        num_workers=args.workers,
-        pin_memory=pin,
-    )
+    # -----------------------------------------
+    # FIX #3 -- WEIGHTED RANDOM SAMPLER
+    # Positive patches (has_coconut=1) are sampled args.pos_oversample x
+    # more often than background patches during training.
+    # This ensures every batch has a healthy mix of coconut pixels
+    # even though they are <1% of the dataset.
+    # NOTE: shuffle=True must NOT be set when using a sampler.
+    # -----------------------------------------
+    if has_coconut is not None and train_idx is not None:
+        train_weights = [
+            args.pos_oversample if has_coconut[i] else 1.0
+            for i in train_idx
+        ]
+        sampler = WeightedRandomSampler(
+            weights=train_weights,
+            num_samples=len(train_weights),
+            replacement=True,
+        )
+        pos_in_train  = sum(1 for w in train_weights if w > 1.0)
+        print(f"   WeightedRandomSampler: {pos_in_train} pos patches oversampled {args.pos_oversample}x")
+        log.info(f"WeightedRandomSampler: pos={pos_in_train}, oversample={args.pos_oversample}x")
+        train_dl = DataLoader(
+            train_ds,
+            batch_size=BATCH_SIZE,
+            sampler=sampler,          # replaces shuffle=True
+            num_workers=args.workers,
+            pin_memory=pin,
+        )
+    else:
+        # Fallback: shuffle without sampler
+        train_dl = DataLoader(
+            train_ds,
+            batch_size=BATCH_SIZE,
+            shuffle=True,
+            num_workers=args.workers,
+            pin_memory=pin,
+        )
+
     val_dl = DataLoader(
         val_ds,
         batch_size=BATCH_SIZE,
@@ -272,7 +371,7 @@ if __name__ == "__main__":
             train_loss += loss.item()
         train_loss /= max(len(train_dl), 1)
 
-        # VALIDATION  – collect all predictions then sweep thresholds once
+        # VALIDATION  - collect all predictions then sweep thresholds once
         model.eval()
         val_loss    = 0.0
         all_preds   = []
@@ -349,16 +448,16 @@ if __name__ == "__main__":
                 "recall":      avg_recall,
                 "score":       score,
                 "config": {
-                    "in_channels":     IN_CH,
-                    "threshold":       FIXED_THR,
-                    "best_threshold":  best_thr,
+                    "in_channels":      IN_CH,
+                    "threshold":        FIXED_THR,
+                    "best_threshold":   best_thr,
                     "threshold_metric": args.metric,
-                    "t_min":           args.t_min,
-                    "t_max":           args.t_max,
-                    "t_step":          args.t_step,
-                    "t_fine_step":     args.t_fine_step,
-                    "aoi":             AOI,
-                    "year":            YEAR,
+                    "t_min":            args.t_min,
+                    "t_max":            args.t_max,
+                    "t_step":           args.t_step,
+                    "t_fine_step":      args.t_fine_step,
+                    "aoi":              AOI,
+                    "year":             YEAR,
                 }
             }, BEST_CKPT)
             print(f"  >> Best model saved  (score={score:.4f}, t*={best_thr:.3f})")
@@ -372,7 +471,7 @@ if __name__ == "__main__":
                 log.info(f"Early stopping at epoch {epoch}")
                 break
 
-        # LATEST CHECKPOINT (every epoch — resume-safe)
+        # LATEST CHECKPOINT (every epoch - resume-safe)
         torch.save({
             "epoch":       epoch,
             "model_state": model.state_dict(),
