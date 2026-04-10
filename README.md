@@ -1,6 +1,6 @@
 # Coconut Plantation Mapping
 
-> **A deep learning pipeline for coconut plantation mapping from Sentinel-2 imagery using UNet semantic segmentation — applied to Coimbatore district, Tamil Nadu.**
+> **A deep learning pipeline for coconut plantation mapping from Sentinel-2 imagery using UNet semantic segmentation — applied to Tamil Nadu districts, India.**
 
 [![Python](https://img.shields.io/badge/Python-3776AB?style=flat-square&logo=python&logoColor=white)](https://python.org)
 [![Sentinel-2](https://img.shields.io/badge/Sentinel--2-003DA5?style=flat-square)](https://sentinel.esa.int)
@@ -14,58 +14,64 @@
 
 Coconut palms are one of the most important tropical plantation crops, yet accurate large-scale mapping remains challenging due to spectral similarity with other tree crops. Precise mapping of coconut plantations supports agricultural planning, carbon stock estimation, and biodiversity monitoring.
 
-This project builds a **reproducible deep learning pipeline** that maps coconut plantations from Sentinel-2 satellite imagery using a **multi-spectral UNet segmentation model** — trained on Coimbatore district (a major coconut-growing region in western Tamil Nadu) using labels from the Descals et al. (2023) global coconut palm layer.
-
-It applies convolutional neural networks to learn spatial patterns directly from satellite image patches, achieving pixel-level segmentation at 10m resolution.
+This project builds a **reproducible deep learning pipeline** that maps coconut plantations from Sentinel-2 satellite imagery using a **multi-spectral UNet segmentation model**. The pipeline supports multiple AOIs across Tamil Nadu and accepts either the Descals et al. (2023) global coconut label tiles or manually digitized shapefiles as training labels. An optional WRI/Meta canopy height layer can be added as a structural band to improve discrimination of coconut palms from other vegetation.
 
 ---
 
 ## Scientific Objective
 
-To learn pixel-level representations of coconut plantation canopy from multi-spectral Sentinel-2 imagery, enriched with vegetation-discriminative spectral indices, using deep convolutional semantic segmentation.
+To learn pixel-level representations of coconut plantation canopy from multi-spectral Sentinel-2 imagery, enriched with vegetation-discriminative spectral indices and optional canopy height, using deep convolutional semantic segmentation.
 
 ---
 
 ## Area of Interest
 
-**Coimbatore district, Tamil Nadu, India**
+The pipeline is AOI-agnostic — pass any district name with a corresponding boundary file.
 
-- Approximate bounding box: 76.5°–77.3°E, 10.8°–11.5°N
-- Major coconut-growing area in western Tamil Nadu
-- CRS: EPSG:32643 (UTM Zone 43N)
+**Tested AOIs:**
+- Coimbatore district — major coconut-growing region in western Tamil Nadu (EPSG:32643)
+- Villupuram district — eastern Tamil Nadu (EPSG:32644)
 
 ---
 
-## Label Data Source
+## Label Data Sources
+
+The pipeline supports two label modes, auto-detected from the `--label_dir` argument:
+
+| Mode | Input | When to use |
+|---|---|---|
+| **Descals tiles** | Path to directory of GeoTIFF tiles | Large-area, automated labelling |
+| **Manual shapefile** | Path to a `.shp` polygon file | Custom hand-digitized training areas |
 
 **Descals et al. (2023) Global Coconut Palm Layer**
-
 - Paper: [https://essd.copernicus.org/articles/15/3991/2023/](https://essd.copernicus.org/articles/15/3991/2023/)
 - Dataset: [https://zenodo.org/records/8128183](https://zenodo.org/records/8128183)
 - Binary labels: [0] Not coconut, [1] Coconut palm (closed-canopy)
-- Original resolution: 20m (resampled to 10m using nearest-neighbor interpolation)
-- Produced using U-Net on Sentinel-1 + Sentinel-2 annual composites for 2020
+- Original resolution: 20m → resampled to 10m (nearest-neighbour)
 
 ---
 
 ## Full Pipeline Workflow
 
 ```
-1. Download lowest-cloud Sentinel-2 scenes (Planetary Computer STAC)
+STEP 0 (optional)  Download lowest-cloud Sentinel-2 scene (Planetary Computer STAC)
        |
-2. Mosaic & clip scenes to Coimbatore AOI
+STEP 1             Mosaic & clip scene bands to AOI boundary
        |
-3. Build 11-band spectral feature stack (8 raw + 3 vegetation indices)
+STEP 2             Build spectral feature stack
+                   [B02, B03, B04, B05, B06, B08, B11, B12, NDVI, EVI, NDMI]
+                   + optional Band 12: WRI/Meta Canopy Height (m)
        |
-4. Prepare coconut labels from Descals et al. (clip + resample to 10m)
+STEP 3             Prepare coconut labels
+                   (Descals tiles OR rasterize manual shapefile)
        |
-5. Generate balanced image patches for training
+STEP 4             Generate balanced image patches for training
        |
-6. Train UNet-Transformer segmentation model (Focal + Dice loss)
+STEP 5             Train UNet-Transformer segmentation model (Focal + Dice loss)
        |
-7. Sliding-window inference over full AOI
+STEP 6             Sliding-window inference over full AOI → probability map
        |
-8. Evaluate segmentation performance (IoU)
+STEP 7             Evaluate segmentation performance (IoU / F1)
 ```
 
 ---
@@ -79,21 +85,33 @@ To learn pixel-level representations of coconut plantation canopy from multi-spe
 | B02 | Blue | 10m |
 | B03 | Green | 10m |
 | B04 | Red | 10m |
-| B05 | Red Edge 1 | 20m (resampled to 10m) |
-| B06 | Red Edge 2 | 20m (resampled to 10m) |
+| B05 | Red Edge 1 | 20m → 10m |
+| B06 | Red Edge 2 | 20m → 10m |
 | B08 | Near Infrared | 10m |
-| B11 | Shortwave Infrared 1 | 20m (resampled to 10m) |
-| B12 | Shortwave Infrared 2 | 20m (resampled to 10m) |
+| B11 | Shortwave Infrared 1 | 20m → 10m |
+| B12 | Shortwave Infrared 2 | 20m → 10m |
 
 **Vegetation spectral indices computed:**
 
 | Index | Formula | Purpose |
 |---|---|---|
-| NDVI | (B08 - B04) / (B08 + B04) | Vegetation greenness |
-| EVI | 2.5 * (B08 - B04) / (B08 + 6*B04 - 7.5*B02 + 1) | Enhanced vegetation sensitivity |
-| NDMI | (B08 - B11) / (B08 + B11) | Moisture — separates coconut from dry vegetation |
+| NDVI | (B08 − B04) / (B08 + B04) | Vegetation greenness |
+| EVI | 2.5 × (B08 − B04) / (B08 + 6×B04 − 7.5×B02 + 1) | Enhanced vegetation sensitivity |
+| NDMI | (B08 − B11) / (B08 + B11) | Moisture — separates coconut from dry vegetation |
 
-**Final model input:** 11-channel feature stack `[B02, B03, B04, B05, B06, B08, B11, B12, NDVI, EVI, NDMI]`
+**Optional structural band:**
+
+| Band | Source | Purpose |
+|---|---|---|
+| Canopy Height (m) | WRI / Meta High-Resolution Canopy Height Maps (2024), 1m | Separates coconut palms (15–30m) from low-canopy crops |
+
+Canopy height can be downloaded from:
+- **GEE:** `ee.ImageCollection('projects/sat-io/open-datasets/facebook/meta-canopy-height')`
+- **AWS:** `aws s3 cp --no-sign-request s3://dataforgood-fb-data/forests/v1/alsgedi_global_v6_float/ .`
+- **Meta:** https://ai.meta.com/ai-for-good/datasets/canopy-height-maps/
+
+**Final model input (without canopy height):** 11-channel stack
+**Final model input (with canopy height):** 12-channel stack
 
 ---
 
@@ -101,31 +119,32 @@ To learn pixel-level representations of coconut plantation canopy from multi-spe
 
 **UNet-Transformer Semantic Segmentation**
 - Encoder-decoder structure with skip connections
-- Transformer bottleneck with multi-head self-attention for long-range spatial modeling
-- 11-channel multi-spectral input
+- Transformer bottleneck with multi-head self-attention for long-range spatial modelling
+- Auto-detects input channels from the stack (11 or 12)
 - Pixel-level binary classification output (coconut / non-coconut)
 
 **Loss Function:**
 ```
 Loss = Focal Loss (alpha=0.8, gamma=3.0) + Dice Loss
 ```
-Focal Loss handles class imbalance (coconut is minority class, gamma=3.0 for sparser targets). Dice Loss handles region-level spatial overlap.
+Focal Loss handles class imbalance (coconut is minority class). Dice Loss handles region-level spatial overlap.
 
 ---
 
 ## Performance
 
-**Primary metric: Intersection over Union (IoU)**
+**Primary metrics: IoU and F1**
 
 ```
 IoU = TP / (TP + FP + FN)
+F1  = 2×TP / (2×TP + FP + FN)
 ```
 
 | IoU Range | Interpretation |
 |---|---|
 | < 0.40 | Weak |
-| 0.40 - 0.59 | Moderate |
-| 0.60 - 0.70 | Strong |
+| 0.40–0.59 | Moderate |
+| 0.60–0.70 | Strong |
 | > 0.70 | Research-grade |
 
 ---
@@ -136,23 +155,24 @@ IoU = TP / (TP + FP + FN)
 coconut_plantation_mapping/
 |
 +-- scripts/
-|   +-- 00_download_sentinel2_best_per_year.py   # Satellite acquisition
-|   +-- 01_prepare_aoi_raw.py                    # AOI preprocessing
-|   +-- 02_build_stack.py                        # Vegetation spectral stack builder
-|   +-- 03_download_coconut_labels.py            # Descals coconut label preparation
-|   +-- evaluate_iou.py                          # Evaluation metrics
+|   +-- 00_download_sentinel2_best_per_year.py   # Download best (lowest-cloud) Sentinel-2 scene
+|   +-- 01_prepare_aoi_raw.py                    # Clip bands to AOI boundary
+|   +-- 02_build_stack.py                        # Build spectral + canopy height stack
+|   +-- 03_download_coconut_labels.py            # Descals et al. label preparation
+|   +-- 03_rasterize_manual_labels.py            # Manual shapefile → raster label
+|   +-- evaluate_iou.py                          # Threshold sweep + IoU / F1 evaluation
 |   +-- dl/
 |       +-- dataset.py                           # CoconutDataset class
 |       +-- unet_model.py                        # Basic UNet architecture
 |       +-- unet_transformer.py                  # UNet + Transformer model
 |       +-- make_patches.py                      # Patch generation
 |       +-- train_unet.py                        # Training script
-|       +-- predict_unet.py                      # Inference script
+|       +-- predict_unet.py                      # Sliding-window inference
 |
-+-- data/           # Satellite imagery, AOI, labels
-+-- models/         # Saved model checkpoints
-+-- outputs/        # Prediction maps and evaluation results
-+-- run.py          # End-to-end runner script
++-- data/           # Satellite imagery, AOI boundaries, labels, patches
++-- models/         # Saved model checkpoints (.pth)
++-- outputs/        # Prediction probability maps and evaluation results
++-- run.py          # End-to-end one-shot pipeline runner
 +-- environment.yml
 ```
 
@@ -171,37 +191,80 @@ export KMP_DUPLICATE_LIB_OK=TRUE
 
 ## Run the Pipeline
 
-**End-to-end:**
+**End-to-end (Descals labels, no canopy height):**
 ```bash
-python run.py --year 2020 --aoi coimbatore --label_dir /path/to/descals_tiles
+python run.py --year 2025 --aoi villupuram \
+  --label_dir data/raw/training/GlobalCoconutLayer_2020_v1-2
 ```
 
-**Step by step:**
+**End-to-end (manual shapefile labels + canopy height):**
 ```bash
-# Step 1 -- Download Sentinel-2 imagery
-python scripts/00_download_sentinel2_best_per_year.py --year 2020 --aoi coimbatore
+python run.py --year 2025 --aoi villupuram \
+  --label_dir data/raw/training/my_polygons.shp \
+  --canopy_height data/raw/canopy_height/canopy_villupuram.tif
+```
 
-# Step 2 -- Prepare AOI
-python scripts/01_prepare_aoi_raw.py --year 2020 --aoi coimbatore
+**Skip download (imagery already on disk):**
+```bash
+python run.py --year 2025 --aoi villupuram \
+  --label_dir data/raw/training/GlobalCoconutLayer_2020_v1-2 \
+  --skip_download
+```
 
-# Step 3 -- Build spectral feature stack
-python scripts/02_build_stack.py --year 2020 --aoi coimbatore
+**Skip training (re-run prediction + evaluation only):**
+```bash
+python run.py --year 2025 --aoi villupuram \
+  --label_dir data/raw/training/GlobalCoconutLayer_2020_v1-2 \
+  --skip_download --skip_train
+```
 
-# Step 4 -- Prepare coconut labels from Descals et al.
-python scripts/03_download_coconut_labels.py --year 2020 --aoi coimbatore \
-    --label_dir /path/to/descals_tiles
+### Key Arguments
 
-# Step 5 -- Create image patches
-python -m scripts.dl.make_patches --year 2020 --aoi coimbatore
+| Argument | Default | Description |
+|---|---|---|
+| `--year` | required | Target year for Sentinel-2 imagery |
+| `--aoi` | required | AOI name (must match boundary file) |
+| `--label_dir` | None | Path to Descals directory **or** `.shp` file |
+| `--canopy_height` | None | Path to WRI/Meta canopy height `.tif` |
+| `--patch` | 64 | Patch size in pixels |
+| `--stride` | 32 | Patch stride in pixels |
+| `--threshold` | 0.35 | Probability threshold for binary prediction |
+| `--all_touched` | False | (Shapefile mode) burn pixels touching polygon edges |
+| `--skip_download` | False | Skip Sentinel-2 download step |
+| `--skip_train` | False | Skip model training step |
 
-# Step 6 -- Train UNet model
-python -m scripts.dl.train_unet --year 2020 --aoi coimbatore
+**Step-by-step:**
+```bash
+# Step 0 — Download Sentinel-2 (best cloud-free scene)
+python scripts/00_download_sentinel2_best_per_year.py --year 2025 --aoi villupuram
 
-# Step 7 -- Run inference
-python -m scripts.dl.predict_unet --year 2020 --aoi coimbatore
+# Step 1 — Clip bands to AOI
+python scripts/01_prepare_aoi_raw.py --year 2025 --aoi villupuram
 
-# Step 8 -- Evaluate
-python scripts/evaluate_iou.py --year 2020 --aoi coimbatore
+# Step 2 — Build spectral stack (+ optional canopy height)
+python scripts/02_build_stack.py --year 2025 --aoi villupuram
+python scripts/02_build_stack.py --year 2025 --aoi villupuram \
+  --canopy_height data/raw/canopy_height/canopy_villupuram.tif
+
+# Step 3 — Prepare labels (Descals tiles)
+python scripts/03_download_coconut_labels.py --year 2025 --aoi villupuram \
+  --label_dir data/raw/training/GlobalCoconutLayer_2020_v1-2
+
+# Step 3 — Prepare labels (manual shapefile)
+python scripts/03_rasterize_manual_labels.py --year 2025 --aoi villupuram \
+  --shp data/raw/training/my_polygons.shp
+
+# Step 4 — Generate patches
+python -m scripts.dl.make_patches --year 2025 --aoi villupuram
+
+# Step 5 — Train
+python -m scripts.dl.train_unet --year 2025 --aoi villupuram
+
+# Step 6 — Predict
+python -m scripts.dl.predict_unet --year 2025 --aoi villupuram
+
+# Step 7 — Evaluate
+python scripts/evaluate_iou.py --year 2025 --aoi villupuram
 ```
 
 ---
@@ -229,7 +292,7 @@ python scripts/evaluate_iou.py --year 2020 --aoi coimbatore
 
 ## Author
 
-**Athithiyan M R** -- Geospatial Data Scientist | Remote Sensing | Climate Analytics
+**Athithiyan M R** — Geospatial Data Scientist | Remote Sensing | Climate Analytics
 
 [![LinkedIn](https://img.shields.io/badge/LinkedIn-Connect-0A66C2?style=flat-square&logo=linkedin)](https://www.linkedin.com/in/athithiyan-m-r-/)
 [![GitHub](https://img.shields.io/badge/GitHub-Athithiyanmr-181717?style=flat-square&logo=github)](https://github.com/Athithiyanmr)
@@ -240,11 +303,12 @@ python scripts/evaluate_iou.py --year 2020 --aoi coimbatore
 
 - ESA Sentinel-2 Mission
 - Microsoft Planetary Computer & STAC API
-- Descals, A. et al. (2023). High-resolution global map of closed-canopy coconut palm. Earth System Science Data, 15, 3991-4010.
+- Descals, A. et al. (2023). High-resolution global map of closed-canopy coconut palm. *Earth System Science Data*, 15, 3991–4010.
+- Meta & WRI High Resolution Canopy Height Maps (2024)
 - Zenodo dataset: [10.5281/zenodo.8128183](https://zenodo.org/records/8128183)
 
 ---
 
 ## License
 
-MIT License (c) 2026 Athithiyan M R
+MIT License © 2026 Athithiyan M R
