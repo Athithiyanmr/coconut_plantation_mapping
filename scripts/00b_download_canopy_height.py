@@ -7,8 +7,8 @@ tiles folder, merge them, clip to the AOI boundary, and save:
 
     data/raw/canopy_height/{aoi}.tif
 
-Uses gdal_merge.py + gdalwarp so tiles are processed block-by-block on
-disk — no full in-memory load, safe for large 1m resolution tiles.
+Uses GDAL VRT (virtual mosaic) + gdalwarp via Python osgeo API so tiles
+are processed block-by-block on disk — no full in-memory load.
 
 Data source
 -----------
@@ -27,7 +27,7 @@ Usage
 
 import argparse
 import logging
-import subprocess
+import sys
 import tempfile
 from pathlib import Path
 
@@ -76,7 +76,6 @@ print(f"\n[canopy height] AOI: {AOI_NAME}")
 aoi_gdf  = gpd.read_file(BOUNDARY_PATH).to_crs("EPSG:4326")
 aoi_bbox = box(*aoi_gdf.total_bounds)
 bbox     = aoi_gdf.total_bounds
-
 print(f"   AOI bbox (WGS84): {bbox[0]:.4f}E  {bbox[1]:.4f}N  {bbox[2]:.4f}E  {bbox[3]:.4f}N")
 
 # ---------------------------------------------------------------------------
@@ -108,58 +107,62 @@ for m in matching:
 log.info(f"Matching tiles: {[Path(p).name for p in matching]}")
 
 # ---------------------------------------------------------------------------
-# GET AOI BOUNDS IN TILE CRS (needed for gdalwarp -te)
+# GET AOI BOUNDS IN TILE CRS
 # ---------------------------------------------------------------------------
 with rasterio.open(matching[0]) as src:
-    tile_crs = src.crs
+    tile_crs  = src.crs
+    src_nodata = src.nodata  # could be None for these tiles
 
 aoi_tile = aoi_gdf.to_crs(tile_crs)
 minx, miny, maxx, maxy = aoi_tile.total_bounds
-print(f"   AOI bbox in tile CRS ({tile_crs}): {minx:.2f} {miny:.2f} {maxx:.2f} {maxy:.2f}")
+print(f"   AOI bbox in tile CRS: {minx:.2f} {miny:.2f} {maxx:.2f} {maxy:.2f}")
 
 # ---------------------------------------------------------------------------
-# MERGE + CLIP USING GDAL (streams block-by-block, avoids OOM / SIGKILL)
-#
-# Step 1: gdal_merge.py  — merge intersecting tiles -> temp merged.tif
-# Step 2: gdalwarp       — clip to AOI bbox, convert to Float32, LZW
+# MERGE via GDAL VRT + warp via osgeo.gdal Python API
+# This avoids any PATH / shell issues with gdal_merge.py
 # ---------------------------------------------------------------------------
-def run_cmd(cmd, label):
-    print(f"   {label}...")
-    result = subprocess.run(cmd, capture_output=True, text=True)
-    if result.returncode != 0:
-        raise RuntimeError(f"{label} failed:\nSTDOUT: {result.stdout}\nSTDERR: {result.stderr}")
+try:
+    from osgeo import gdal
+except ImportError:
+    print("ERROR: osgeo.gdal not available. Install with: conda install gdal")
+    sys.exit(1)
 
+gdal.UseExceptions()
 
 with tempfile.TemporaryDirectory() as tmpdir:
+    vrt_path    = str(Path(tmpdir) / "mosaic.vrt")
     merged_path = str(Path(tmpdir) / "merged.tif")
 
-    # Step 1 — merge tiles to disk
-    run_cmd([
-        "gdal_merge.py",
-        "-o", merged_path,
-        "-of", "GTiff",
-        "-co", "COMPRESS=LZW",
-        "-co", "TILED=YES",
-        "-co", "BLOCKXSIZE=256",
-        "-co", "BLOCKYSIZE=256",
-        "-n",        "255",
-        "-a_nodata", "255",
-    ] + matching, "Merging tiles with gdal_merge")
+    # Step 1 — build VRT mosaic (zero memory, just metadata)
+    print("   Building VRT mosaic...")
+    vrt_options = gdal.BuildVRTOptions(resampleAlg="nearest")
+    vrt_ds = gdal.BuildVRT(vrt_path, matching, options=vrt_options)
+    if vrt_ds is None:
+        raise RuntimeError("gdal.BuildVRT failed — check tile paths")
+    vrt_ds.FlushCache()
+    vrt_ds = None
 
-    # Step 2 — clip to AOI bbox + convert to Float32
-    run_cmd([
-        "gdalwarp",
-        "-te",        str(minx), str(miny), str(maxx), str(maxy),
-        "-ot",        "Float32",
-        "-dstnodata", "nan",
-        "-co",        "COMPRESS=LZW",
-        "-co",        "TILED=YES",
-        "-co",        "BLOCKXSIZE=256",
-        "-co",        "BLOCKYSIZE=256",
-        "-overwrite",
-        merged_path,
-        str(OUT_PATH),
-    ], "Clipping to AOI bbox with gdalwarp")
+    # Step 2 — warp VRT -> clipped Float32 GeoTIFF
+    print("   Warping (clip + Float32 convert)...")
+    warp_options = gdal.WarpOptions(
+        outputBounds=(minx, miny, maxx, maxy),
+        outputType=gdal.GDT_Float32,
+        dstNodata=float("nan"),
+        creationOptions=[
+            "COMPRESS=LZW",
+            "TILED=YES",
+            "BLOCKXSIZE=256",
+            "BLOCKYSIZE=256",
+        ],
+        multithread=True,
+        warpMemoryLimit=256,   # MB per thread — keeps RAM low
+        callback=gdal.TermProgress_nocb,
+    )
+    out_ds = gdal.Warp(str(OUT_PATH), vrt_path, options=warp_options)
+    if out_ds is None:
+        raise RuntimeError("gdal.Warp failed")
+    out_ds.FlushCache()
+    out_ds = None
 
 # ---------------------------------------------------------------------------
 # TAG OUTPUT
