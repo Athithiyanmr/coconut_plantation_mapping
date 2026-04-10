@@ -7,19 +7,16 @@ tiles folder, merge them, clip to the AOI boundary, and save:
 
     data/raw/canopy_height/{aoi}.tif
 
-You must have already downloaded the Meta/WRI canopy height tiles.
-The script accepts any flat folder of .tif files — it reads each file's
-geographic extent and picks only those that overlap the AOI.
+Uses gdal_merge.py + gdalwarp so tiles are processed block-by-block on
+disk — no full in-memory load, safe for large 1m resolution tiles.
 
 Data source
 -----------
 Meta & WRI High Resolution Canopy Height Maps (2024)
   - Resolution  : 1 m
   - Temporal    : 2018-2020
-  - Units       : metres above ground (vegetation >= 1 m)
+  - Units       : metres above ground
   - License     : CC BY 4.0
-  - AWS S3:  s3://dataforgood-fb-data/forests/v1/alsgedi_global_v6_float/chm/
-  - Tile index:  tiles.geojson (QuadKey named .tif files inside chm/ subfolder)
 
 Usage
 -----
@@ -30,14 +27,12 @@ Usage
 
 import argparse
 import logging
+import subprocess
 import tempfile
 from pathlib import Path
 
 import geopandas as gpd
-import numpy as np
 import rasterio
-from rasterio.merge import merge
-from rasterio.mask import mask as rio_mask
 from rasterio.warp import transform_bounds
 from shapely.geometry import box
 
@@ -54,17 +49,9 @@ log = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 # ARGS
 # ---------------------------------------------------------------------------
-parser = argparse.ArgumentParser(
-    description="Select & clip WRI/Meta canopy height tiles for an AOI from a local folder"
-)
-parser.add_argument(
-    "--aoi", required=True,
-    help="AOI name (matches data/raw/boundaries/{aoi}.shp)"
-)
-parser.add_argument(
-    "--tiles_dir", required=True,
-    help="Path to local folder containing Meta/WRI canopy height .tif tiles"
-)
+parser = argparse.ArgumentParser()
+parser.add_argument("--aoi",       required=True)
+parser.add_argument("--tiles_dir", required=True)
 args = parser.parse_args()
 
 AOI_NAME  = args.aoi
@@ -75,19 +62,12 @@ OUT_PATH      = Path(f"data/raw/canopy_height/{AOI_NAME}.tif")
 OUT_PATH.parent.mkdir(parents=True, exist_ok=True)
 
 # ---------------------------------------------------------------------------
-# VALIDATE INPUTS
+# VALIDATE
 # ---------------------------------------------------------------------------
 if not BOUNDARY_PATH.exists():
-    raise FileNotFoundError(
-        f"AOI boundary not found: {BOUNDARY_PATH}\n"
-        f"Expected: data/raw/boundaries/{AOI_NAME}.shp"
-    )
-
+    raise FileNotFoundError(f"AOI boundary not found: {BOUNDARY_PATH}")
 if not TILES_DIR.exists():
-    raise FileNotFoundError(
-        f"Tiles directory not found: {TILES_DIR}\n"
-        "Pass the folder containing your .tif canopy height tiles with --tiles_dir"
-    )
+    raise FileNotFoundError(f"Tiles directory not found: {TILES_DIR}")
 
 # ---------------------------------------------------------------------------
 # LOAD AOI
@@ -95,21 +75,16 @@ if not TILES_DIR.exists():
 print(f"\n[canopy height] AOI: {AOI_NAME}")
 aoi_gdf  = gpd.read_file(BOUNDARY_PATH).to_crs("EPSG:4326")
 aoi_bbox = box(*aoi_gdf.total_bounds)
-bbox     = aoi_gdf.total_bounds   # minx, miny, maxx, maxy
+bbox     = aoi_gdf.total_bounds
 
-print(f"   AOI bbox (WGS84): "
-      f"{bbox[0]:.4f}E  {bbox[1]:.4f}N  {bbox[2]:.4f}E  {bbox[3]:.4f}N")
+print(f"   AOI bbox (WGS84): {bbox[0]:.4f}E  {bbox[1]:.4f}N  {bbox[2]:.4f}E  {bbox[3]:.4f}N")
 
 # ---------------------------------------------------------------------------
-# SCAN TILES FOLDER — find .tif files whose extent intersects AOI
+# FIND INTERSECTING TILES
 # ---------------------------------------------------------------------------
 all_tiles = sorted(TILES_DIR.rglob("*.tif")) + sorted(TILES_DIR.rglob("*.tiff"))
-
 if not all_tiles:
-    raise FileNotFoundError(
-        f"No .tif files found in: {TILES_DIR}\n"
-        "Make sure you're pointing to the folder containing the canopy height tiles."
-    )
+    raise FileNotFoundError(f"No .tif files found in: {TILES_DIR}")
 
 print(f"   Scanning {len(all_tiles)} tiles in {TILES_DIR} ...")
 
@@ -117,98 +92,79 @@ matching = []
 for tile_path in all_tiles:
     try:
         with rasterio.open(tile_path) as src:
-            if str(src.crs) != "EPSG:4326":
-                tb = transform_bounds(src.crs, "EPSG:4326", *src.bounds)
-            else:
-                tb = src.bounds
-            tile_box = box(tb[0], tb[1], tb[2], tb[3])
-            if aoi_bbox.intersects(tile_box):
-                matching.append(tile_path)
+            tb = (transform_bounds(src.crs, "EPSG:4326", *src.bounds)
+                  if str(src.crs) != "EPSG:4326" else tuple(src.bounds))
+            if aoi_bbox.intersects(box(*tb)):
+                matching.append(str(tile_path))
     except Exception as e:
         log.warning(f"Could not read {tile_path.name}: {e}")
-        continue
 
 if not matching:
-    raise RuntimeError(
-        f"No tiles in {TILES_DIR} intersect the AOI bbox.\n"
-        f"AOI bbox: {bbox}\n"
-        "Double-check that your tiles cover Tamil Nadu / India."
-    )
+    raise RuntimeError(f"No tiles intersect the AOI bbox: {bbox}")
 
 print(f"   Found {len(matching)} intersecting tile(s):")
 for m in matching:
-    print(f"     {m.name}")
-log.info(f"Matching tiles: {[p.name for p in matching]}")
+    print(f"     {Path(m).name}")
+log.info(f"Matching tiles: {[Path(p).name for p in matching]}")
 
 # ---------------------------------------------------------------------------
-# MERGE TILES
+# GET AOI BOUNDS IN TILE CRS (needed for gdalwarp -te)
 # ---------------------------------------------------------------------------
-print("   Merging tiles...")
-open_files = [rasterio.open(p) for p in matching]
-merged_arr, merged_transform = merge(open_files)
-merged_meta = open_files[0].meta.copy()
-merged_meta.update({
-    "driver":    "GTiff",
-    "height":    merged_arr.shape[1],
-    "width":     merged_arr.shape[2],
-    "transform": merged_transform,
-    "crs":       open_files[0].crs,
-    "compress":  "lzw",
-})
-for f in open_files:
-    f.close()
+with rasterio.open(matching[0]) as src:
+    tile_crs = src.crs
+
+aoi_tile = aoi_gdf.to_crs(tile_crs)
+minx, miny, maxx, maxy = aoi_tile.total_bounds
+print(f"   AOI bbox in tile CRS ({tile_crs}): {minx:.2f} {miny:.2f} {maxx:.2f} {maxy:.2f}")
 
 # ---------------------------------------------------------------------------
-# REPROJECT AOI GEOMETRIES to tile CRS (for clipping)
+# MERGE + CLIP USING GDAL (streams block-by-block, avoids OOM / SIGKILL)
+#
+# Step 1: gdal_merge.py  — merge intersecting tiles -> temp merged.tif
+# Step 2: gdalwarp       — clip to AOI bbox, convert to Float32, LZW
 # ---------------------------------------------------------------------------
-tile_crs = merged_meta["crs"]
-aoi_clip = aoi_gdf.to_crs(tile_crs)
-geoms    = [g.__geo_interface__ for g in aoi_clip.geometry]
+def run_cmd(cmd, label):
+    print(f"   {label}...")
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    if result.returncode != 0:
+        raise RuntimeError(f"{label} failed:\nSTDOUT: {result.stdout}\nSTDERR: {result.stderr}")
 
-# ---------------------------------------------------------------------------
-# CLIP TO AOI
-# Write merged to a temp file, then mask.
-# Use filled=False to get a masked array back — avoids the
-# "Cannot convert fill_value nan to dtype uint8" error when the
-# source tiles are integer (uint8) rasters.
-# After masking, convert to float32 and fill masked pixels with NaN.
-# ---------------------------------------------------------------------------
-print("   Clipping to AOI boundary...")
-with tempfile.NamedTemporaryFile(suffix=".tif", delete=False) as tmp_f:
-    tmp_path = Path(tmp_f.name)
 
-with rasterio.open(tmp_path, "w", **merged_meta) as tmp_ds:
-    tmp_ds.write(merged_arr)
+with tempfile.TemporaryDirectory() as tmpdir:
+    merged_path = str(Path(tmpdir) / "merged.tif")
 
-with rasterio.open(tmp_path) as tmp_ds:
-    # filled=False returns a numpy masked array — safe for any dtype
-    clipped_masked, clipped_transform = rio_mask(
-        tmp_ds, geoms, crop=True, filled=False
-    )
-    # Convert to float32 FIRST, then fill masked pixels with NaN
-    clipped_arr = clipped_masked.astype("float32")
-    clipped_arr = clipped_arr.filled(np.nan)
+    # Step 1 — merge tiles to disk
+    run_cmd([
+        "gdal_merge.py",
+        "-o", merged_path,
+        "-of", "GTiff",
+        "-co", "COMPRESS=LZW",
+        "-co", "TILED=YES",
+        "-co", "BLOCKXSIZE=256",
+        "-co", "BLOCKYSIZE=256",
+        "-n",        "255",
+        "-a_nodata", "255",
+    ] + matching, "Merging tiles with gdal_merge")
 
-    clipped_meta = tmp_ds.meta.copy()
-    clipped_meta.update({
-        "height":     clipped_arr.shape[1],
-        "width":      clipped_arr.shape[2],
-        "transform":  clipped_transform,
-        "nodata":     np.nan,
-        "dtype":      "float32",
-        "compress":   "lzw",
-        "tiled":      True,
-        "blockxsize": 256,
-        "blockysize": 256,
-    })
-
-tmp_path.unlink(missing_ok=True)
+    # Step 2 — clip to AOI bbox + convert to Float32
+    run_cmd([
+        "gdalwarp",
+        "-te",        str(minx), str(miny), str(maxx), str(maxy),
+        "-ot",        "Float32",
+        "-dstnodata", "nan",
+        "-co",        "COMPRESS=LZW",
+        "-co",        "TILED=YES",
+        "-co",        "BLOCKXSIZE=256",
+        "-co",        "BLOCKYSIZE=256",
+        "-overwrite",
+        merged_path,
+        str(OUT_PATH),
+    ], "Clipping to AOI bbox with gdalwarp")
 
 # ---------------------------------------------------------------------------
-# SAVE
+# TAG OUTPUT
 # ---------------------------------------------------------------------------
-with rasterio.open(OUT_PATH, "w", **clipped_meta) as dst:
-    dst.write(clipped_arr)
+with rasterio.open(OUT_PATH, "r+") as dst:
     dst.update_tags(
         source="Meta & WRI High Resolution Canopy Height Maps (2024)",
         resolution_native="1m",
