@@ -19,15 +19,20 @@ parser.add_argument("--label_dir", default=None,
                     help="Coconut label source: path to a .shp file (manual polygons) "
                          "or a directory containing Descals GeoTIFF tiles")
 
-# WRI / Meta canopy height — now auto-downloaded if --canopy_height is not
-# given explicitly.  Pass --skip_canopy to disable entirely.
+# WRI / Meta canopy height
+# Three modes:
+#   1. --canopy_tiles_dir  -> you have the raw tiles locally; script selects + clips them
+#   2. --canopy_height     -> you already have the final clipped .tif ready
+#   3. --skip_canopy       -> skip entirely (11-band stack)
+parser.add_argument("--canopy_tiles_dir", default=None,
+                    help="Path to your local folder of WRI/Meta canopy height .tif tiles. "
+                         "The pipeline will auto-select tiles intersecting the AOI, "
+                         "merge them, clip to AOI and save to data/raw/canopy_height/{aoi}.tif")
 parser.add_argument("--canopy_height", default=None,
-                    help="Path to an existing canopy height .tif. "
-                         "If omitted, the pipeline auto-downloads the WRI/Meta "
-                         "tiles for the AOI and saves to "
-                         "data/raw/canopy_height/{aoi}.tif")
+                    help="Path to an already-clipped canopy height .tif for the AOI. "
+                         "Use this if you've already run the canopy step before.")
 parser.add_argument("--skip_canopy", action="store_true",
-                    help="Skip canopy height entirely (11-band stack instead of 12)")
+                    help="Skip canopy height entirely (builds 11-band stack instead of 12)")
 
 # DL tuning
 parser.add_argument("--patch",     type=int,   default=64)
@@ -49,14 +54,16 @@ PATCH     = args.patch
 STRIDE    = args.stride
 THRESHOLD = args.threshold
 
-# Resolve canopy height path
-# Priority: explicit --canopy_height > auto path > skip
+# Resolve final canopy height .tif path
+# Priority: --skip_canopy > --canopy_height (explicit) > auto path (from tiles or cached)
+AUTO_CANOPY_PATH = Path(f"data/raw/canopy_height/{AOI}.tif")
+
 if args.skip_canopy:
     CANOPY_HEIGHT = None
 elif args.canopy_height:
     CANOPY_HEIGHT = args.canopy_height
 else:
-    CANOPY_HEIGHT = f"data/raw/canopy_height/{AOI}.tif"
+    CANOPY_HEIGHT = str(AUTO_CANOPY_PATH)
 
 
 # --------------------------------
@@ -86,76 +93,89 @@ def is_shapefile(path):
 # CLEAN macOS hidden files
 # --------------------------------
 run('find . -name "._*" -type f -delete')
-print("[cleanup] No macOS ._* ghost files found")
 
 
 # --------------------------------
 # PIPELINE
 # --------------------------------
 
-# STEP 0 — Download Sentinel-2
-print("\nSTEP 1/7  --  Download Sentinel-2")
+# STEP 1 — Download Sentinel-2
+print("\nSTEP 1/8  --  Download Sentinel-2")
 if not args.skip_download:
     run(f"python scripts/00_download_sentinel2_best_per_year.py --year {YEAR} --aoi {AOI}")
 else:
-    print("  [skipped]")
+    print("  [skipped] --skip_download was set")
 
 run('find . -name "._*" -type f -delete')
 
-# STEP 1 — Download canopy height (auto, unless skipped or file already exists)
-print("\nSTEP 2/7  --  Canopy Height")
+# STEP 2 — Canopy height
+print("\nSTEP 2/8  --  Canopy Height")
 if CANOPY_HEIGHT is None:
-    print("  [skipped] --skip_canopy was set")
+    print("  [skipped] --skip_canopy was set  ->  will build 11-band stack")
 elif Path(CANOPY_HEIGHT).exists():
-    print(f"  [cached]  {CANOPY_HEIGHT} already exists, skipping download")
+    print(f"  [cached]  {CANOPY_HEIGHT} already exists, skipping tile selection")
 else:
-    print(f"  Auto-downloading WRI/Meta canopy height for '{AOI}'...")
-    run(f"python scripts/00b_download_canopy_height.py --aoi {AOI}")
+    # Need to build the clipped .tif from raw tiles
+    if args.canopy_tiles_dir:
+        print(f"  Selecting tiles from: {args.canopy_tiles_dir}")
+        run(
+            f"python scripts/00b_download_canopy_height.py "
+            f"--aoi {AOI} "
+            f"--tiles_dir \"{args.canopy_tiles_dir}\""
+        )
+    else:
+        print("  WARNING: canopy height .tif not found and --canopy_tiles_dir not provided.")
+        print(f"           Expected: {CANOPY_HEIGHT}")
+        print("  Options:")
+        print("    a) Pass --canopy_tiles_dir /path/to/your/tiles")
+        print("    b) Pass --skip_canopy to build an 11-band stack")
+        print("  Continuing without canopy height...")
+        CANOPY_HEIGHT = None
 
-# STEP 2 — AOI clip
-print("\nSTEP 3/7  --  Prepare AOI")
+# STEP 3 — AOI clip
+print("\nSTEP 3/8  --  Prepare AOI")
 run(f"python scripts/01_prepare_aoi_raw.py --year {YEAR} --aoi {AOI}")
 
 run('find . -name "._*" -type f -delete')
 
-# STEP 3 — Build stack (+ canopy height if available)
-print("\nSTEP 4/7  --  Build Stack")
+# STEP 4 — Build stack
+print("\nSTEP 4/8  --  Build Stack")
 stack_cmd = f"python scripts/02_build_stack.py --year {YEAR} --aoi {AOI}"
 if CANOPY_HEIGHT and Path(CANOPY_HEIGHT).exists():
-    stack_cmd += f" --canopy_height {CANOPY_HEIGHT}"
-    print(f"  Including canopy height band: {CANOPY_HEIGHT}")
+    stack_cmd += f" --canopy_height \"{CANOPY_HEIGHT}\""
+    print(f"  12-band stack  (including canopy height: {CANOPY_HEIGHT})")
 else:
-    print("  Building 11-band stack (no canopy height)")
+    print("  11-band stack  (no canopy height)")
 run(stack_cmd)
 
 run('find . -name "._*" -type f -delete')
 
-# STEP 4 — Coconut labels
-print("\nSTEP 5/7  --  Coconut Labels")
+# STEP 5 — Coconut labels
+print("\nSTEP 5/8  --  Coconut Labels")
 if LABEL_DIR:
     if is_shapefile(LABEL_DIR):
-        print(f"  [Label mode] Shapefile -> rasterizing manual polygons")
+        print("  [Label mode] Shapefile -> rasterizing manual polygons")
         all_touched_flag = "--all_touched" if args.all_touched else ""
         run(
             f"python scripts/03_rasterize_manual_labels.py "
             f"--year {YEAR} --aoi {AOI} "
-            f"--shp {LABEL_DIR} {all_touched_flag}"
+            f"--shp \"{LABEL_DIR}\" {all_touched_flag}"
         )
     else:
-        print(f"  [Label mode] Directory -> using Descals et al. (2023) tiles")
+        print("  [Label mode] Directory -> using Descals et al. (2023) tiles")
         run(
             f"python scripts/03_download_coconut_labels.py "
-            f"--year {YEAR} --aoi {AOI} --label_dir {LABEL_DIR}"
+            f"--year {YEAR} --aoi {AOI} --label_dir \"{LABEL_DIR}\""
         )
 else:
     print("  [Label mode] --label_dir not provided -- skipping label step")
-    print(f"               Labels must already exist at:")
+    print(f"               Labels must exist at:")
     print(f"               data/processed/training/labels_coconut_{YEAR}_{AOI}.tif")
 
 run('find . -name "._*" -type f -delete')
 
-# STEP 5 — Create patches
-print("\nSTEP 6/7  --  Create Patches")
+# STEP 6 — Create patches
+print("\nSTEP 6/8  --  Create Patches")
 run(
     f"python -m scripts.dl.make_patches "
     f"--year {YEAR} --aoi {AOI} "
@@ -163,15 +183,15 @@ run(
 )
 run('find data/dl -name "._*" -type f -delete')
 
-# STEP 6 — Train
-print("\nSTEP 7/7  --  Train")
+# STEP 7 — Train
+print("\nSTEP 7/8  --  Train")
 if not args.skip_train:
     run(f"python -m scripts.dl.train_unet --year {YEAR} --aoi {AOI}")
 else:
-    print("  [skipped]")
+    print("  [skipped] --skip_train was set")
 
-# STEP 7 — Predict
-print("\nSTEP 8/7  --  Predict")
+# STEP 8 — Predict
+print("\nSTEP 8/8  --  Predict")
 run(
     f"python -m scripts.dl.predict_unet "
     f"--year {YEAR} --aoi {AOI} "
@@ -179,8 +199,8 @@ run(
     f"--threshold {THRESHOLD}"
 )
 
-# STEP 8 — Evaluate
-print("\nSTEP 9/7  --  Evaluate")
+# STEP 9 — Evaluate
+print("\nFINAL STEP  --  Evaluate")
 run(f"python scripts/evaluate_iou.py --year {YEAR} --aoi {AOI}")
 
 
