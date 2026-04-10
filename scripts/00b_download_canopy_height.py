@@ -30,6 +30,7 @@ Usage
 
 import argparse
 import logging
+import tempfile
 from pathlib import Path
 
 import geopandas as gpd
@@ -37,9 +38,8 @@ import numpy as np
 import rasterio
 from rasterio.merge import merge
 from rasterio.mask import mask as rio_mask
-from rasterio.transform import array_bounds
+from rasterio.warp import transform_bounds
 from shapely.geometry import box
-import tempfile
 
 # ---------------------------------------------------------------------------
 # LOGGING
@@ -67,8 +67,8 @@ parser.add_argument(
 )
 args = parser.parse_args()
 
-AOI_NAME   = args.aoi
-TILES_DIR  = Path(args.tiles_dir)
+AOI_NAME  = args.aoi
+TILES_DIR = Path(args.tiles_dir)
 
 BOUNDARY_PATH = Path(f"data/raw/boundaries/{AOI_NAME}.shp")
 OUT_PATH      = Path(f"data/raw/canopy_height/{AOI_NAME}.tif")
@@ -86,7 +86,7 @@ if not BOUNDARY_PATH.exists():
 if not TILES_DIR.exists():
     raise FileNotFoundError(
         f"Tiles directory not found: {TILES_DIR}\n"
-        f"Pass the folder containing your .tif canopy height tiles with --tiles_dir"
+        "Pass the folder containing your .tif canopy height tiles with --tiles_dir"
     )
 
 # ---------------------------------------------------------------------------
@@ -94,8 +94,8 @@ if not TILES_DIR.exists():
 # ---------------------------------------------------------------------------
 print(f"\n[canopy height] AOI: {AOI_NAME}")
 aoi_gdf  = gpd.read_file(BOUNDARY_PATH).to_crs("EPSG:4326")
-aoi_bbox = box(*aoi_gdf.total_bounds)   # shapely box in WGS84
-bbox     = aoi_gdf.total_bounds         # minx, miny, maxx, maxy
+aoi_bbox = box(*aoi_gdf.total_bounds)
+bbox     = aoi_gdf.total_bounds   # minx, miny, maxx, maxy
 
 print(f"   AOI bbox (WGS84): "
       f"{bbox[0]:.4f}E  {bbox[1]:.4f}N  {bbox[2]:.4f}E  {bbox[3]:.4f}N")
@@ -117,8 +117,6 @@ matching = []
 for tile_path in all_tiles:
     try:
         with rasterio.open(tile_path) as src:
-            # Reproject tile bounds to WGS84 for intersection test
-            from rasterio.warp import transform_bounds
             if str(src.crs) != "EPSG:4326":
                 tb = transform_bounds(src.crs, "EPSG:4326", *src.bounds)
             else:
@@ -164,11 +162,16 @@ for f in open_files:
 # REPROJECT AOI GEOMETRIES to tile CRS (for clipping)
 # ---------------------------------------------------------------------------
 tile_crs = merged_meta["crs"]
-aoi_clip  = aoi_gdf.to_crs(tile_crs)
-geoms     = [g.__geo_interface__ for g in aoi_clip.geometry]
+aoi_clip = aoi_gdf.to_crs(tile_crs)
+geoms    = [g.__geo_interface__ for g in aoi_clip.geometry]
 
 # ---------------------------------------------------------------------------
-# CLIP TO AOI — write merged to temp file first, then mask
+# CLIP TO AOI
+# Write merged to a temp file, then mask.
+# Use filled=False to get a masked array back — avoids the
+# "Cannot convert fill_value nan to dtype uint8" error when the
+# source tiles are integer (uint8) rasters.
+# After masking, convert to float32 and fill masked pixels with NaN.
 # ---------------------------------------------------------------------------
 print("   Clipping to AOI boundary...")
 with tempfile.NamedTemporaryFile(suffix=".tif", delete=False) as tmp_f:
@@ -178,9 +181,14 @@ with rasterio.open(tmp_path, "w", **merged_meta) as tmp_ds:
     tmp_ds.write(merged_arr)
 
 with rasterio.open(tmp_path) as tmp_ds:
-    clipped_arr, clipped_transform = rio_mask(
-        tmp_ds, geoms, crop=True, nodata=np.nan, filled=True
+    # filled=False returns a numpy masked array — safe for any dtype
+    clipped_masked, clipped_transform = rio_mask(
+        tmp_ds, geoms, crop=True, filled=False
     )
+    # Convert to float32 FIRST, then fill masked pixels with NaN
+    clipped_arr = clipped_masked.astype("float32")
+    clipped_arr = clipped_arr.filled(np.nan)
+
     clipped_meta = tmp_ds.meta.copy()
     clipped_meta.update({
         "height":     clipped_arr.shape[1],
@@ -200,7 +208,7 @@ tmp_path.unlink(missing_ok=True)
 # SAVE
 # ---------------------------------------------------------------------------
 with rasterio.open(OUT_PATH, "w", **clipped_meta) as dst:
-    dst.write(clipped_arr.astype("float32"))
+    dst.write(clipped_arr)
     dst.update_tags(
         source="Meta & WRI High Resolution Canopy Height Maps (2024)",
         resolution_native="1m",
