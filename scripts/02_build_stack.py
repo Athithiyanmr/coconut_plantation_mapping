@@ -129,17 +129,13 @@ b2s, b3s, b4s, b5s, b6s, b8s, b11s, b12s = [scale(b) for b in [b2, b3, b4, b5, b
 
 # -----------------------------------------
 # VEGETATION SPECTRAL INDICES
-# Optimized for coconut plantation detection
 # -----------------------------------------
 eps = 1e-6
 
-ndvi = (b8s  - b4s)  / (b8s  + b4s  + eps)   # Vegetation greenness
-evi  = 2.5 * (b8s - b4s) / (b8s + 6.0 * b4s - 7.5 * b2s + 1.0 + eps)  # Enhanced Vegetation Index
-ndmi = (b8s  - b11s) / (b8s  + b11s + eps)   # Moisture -- separates coconut from dry vegetation
+ndvi = (b8s  - b4s)  / (b8s  + b4s  + eps)
+evi  = 2.5 * (b8s - b4s) / (b8s + 6.0 * b4s - 7.5 * b2s + 1.0 + eps)
+ndmi = (b8s  - b11s) / (b8s  + b11s + eps)
 
-# -----------------------------------------
-# CLIP INDEX RANGES -- prevent extreme outlier values
-# -----------------------------------------
 for name, arr in [("NDVI", ndvi), ("EVI", evi), ("NDMI", ndmi)]:
     pct1, pct99 = np.nanpercentile(arr[~nodata_mask], [1, 99])
     print(f"   {name:6s} range: [{pct1:.3f}, {pct99:.3f}]")
@@ -147,20 +143,12 @@ for name, arr in [("NDVI", ndvi), ("EVI", evi), ("NDMI", ndmi)]:
 
 # -----------------------------------------
 # CANOPY HEIGHT BAND  (WRI / Meta, 1-m resolution)
-# Dataset: "High Resolution Canopy Height Maps" — Meta & WRI, 2024
-#   - Temporal coverage: 2018-2020 (80 % of pixels from 2018-2020)
-#   - Resolution: 1 m (resampled to Sentinel-2 10 m grid here via bilinear)
-#   - Units: metres above ground for all vegetation ≥ 1 m
-#   - Mean absolute error: 2.8 m (Tolan et al., 2024, RSE 300, 113888)
-#   - License: CC BY 4.0
-#   - GEE asset: ee.ImageCollection("projects/sat-io/open-datasets/facebook/meta-canopy-height")
-#   - AWS S3:    s3://dataforgood-fb-data/forests/v1/alsgedi_global_v6_float/
 #
-# Why it helps coconut mapping:
-#   Coconut palms are tall (15-30 m), slender-canopied trees.  Adding canopy
-#   height cleanly separates them from low scrub, paddy, and banana which share
-#   similar spectral signatures but are <5 m tall.  The height band acts as a
-#   structural filter that reduces false positives from spectrally similar crops.
+# The canopy height tile is at 1m resolution — loading it all at once
+# into RAM causes OOM / SIGKILL.  Instead we keep the source file open
+# and use rasterio.band() to let rasterio stream+reproject block-by-block
+# directly onto the Sentinel-2 10m grid.  This avoids any large array
+# allocation at the native 1m resolution.
 # -----------------------------------------
 canopy_arr = None
 
@@ -174,32 +162,31 @@ if CANOPY_HEIGHT_PATH is not None:
             "  Meta : https://ai.meta.com/ai-for-good/datasets/canopy-height-maps/"
         )
 
-    print("\n   Loading canopy height layer...")
+    print("\n   Loading canopy height layer (streaming reproject to 10m grid)...")
+
+    canopy_arr = np.empty(ref_arr.shape, dtype="float32")
+
     with rasterio.open(CANOPY_HEIGHT_PATH) as src:
-        raw_ch = src.read(1).astype("float32")
         ch_nodata = src.nodata
 
-        # Replace source nodata with NaN
-        if ch_nodata is not None:
-            raw_ch = np.where(raw_ch == ch_nodata, np.nan, raw_ch)
-
-        # Reproject / resample to Sentinel-2 reference grid
-        # Bilinear resampling is appropriate for a continuous height surface.
-        canopy_arr = np.empty(ref_arr.shape, dtype="float32")
+        # reproject streams block-by-block via rasterio.band() —
+        # the full 1m array is NEVER loaded into memory
         reproject(
-            raw_ch, canopy_arr,
-            src_transform=src.transform,
-            src_crs=src.crs,
+            source=rasterio.band(src, 1),
+            destination=canopy_arr,
             dst_transform=ref_meta["transform"],
             dst_crs=ref_meta["crs"],
             resampling=Resampling.bilinear,
         )
 
+    # Replace source nodata with NaN
+    if ch_nodata is not None:
+        canopy_arr = np.where(canopy_arr == ch_nodata, np.nan, canopy_arr)
+
     # Apply same nodata mask as Sentinel-2 bands
     canopy_arr[nodata_mask] = np.nan
 
     # Clip to physically plausible coconut palm heights: 0 – 45 m
-    # (extreme outliers from the CHM can reach 60+ m in error pixels)
     canopy_arr = np.clip(canopy_arr, 0.0, 45.0)
 
     ch_valid = canopy_arr[~nodata_mask & ~np.isnan(canopy_arr)]
@@ -208,20 +195,17 @@ if CANOPY_HEIGHT_PATH is not None:
     log.info(f"CanopyHeight P1={p1:.1f}m, P99={p99:.1f}m")
 
 # -----------------------------------------
-# STACK  (11 bands without canopy height, 12 with)
-# B02, B03, B04, B05, B06, B08, B11, B12, NDVI, EVI, NDMI [, CanopyHeight_m]
+# STACK
 # -----------------------------------------
 band_arrays = [b2s, b3s, b4s, b5s, b6s, b8s, b11s, b12s, ndvi, evi, ndmi]
 if canopy_arr is not None:
     band_arrays.append(canopy_arr)
 
 stack = np.stack(band_arrays).astype("float32")
-
-# Apply nodata mask across all bands
 stack[:, nodata_mask] = np.nan
 
 # -----------------------------------------
-# SAVE WITH BAND DESCRIPTIONS
+# SAVE
 # -----------------------------------------
 n_bands = len(BAND_NAMES)
 ref_meta.update(
@@ -241,7 +225,6 @@ with rasterio.open(out_path, "w", **ref_meta) as dst:
     for i, name in enumerate(BAND_NAMES, start=1):
         dst.update_tags(i, name=name)
 
-    # Record canopy height dataset provenance in file-level metadata
     if canopy_arr is not None:
         dst.update_tags(
             canopy_height_source="Meta & WRI High Resolution Canopy Height Maps (2024)",
