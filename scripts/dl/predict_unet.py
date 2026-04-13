@@ -33,7 +33,7 @@ parser.add_argument("--aoi",         required=True)
 parser.add_argument("--threshold",   type=float, default=0.35,  help="Binarization threshold (default: 0.35)")
 parser.add_argument("--patch",       type=int,   default=128,   help="Patch size -- must match training (default: 128)")
 parser.add_argument("--stride",      type=int,   default=64,    help="Sliding window stride (default: 64)")
-parser.add_argument("--in_channels", type=int,   default=11,    help="Input bands -- must match training (default: 11)")
+parser.add_argument("--in_channels", type=int,   default=None,  help="Input bands -- auto-detected from stack if omitted")
 parser.add_argument("--batch_size",  type=int,   default=16,    help="Patches per inference batch (default: 16)")
 parser.add_argument("--no_binary",   action="store_true",       help="Skip binary output, save probability only")
 args = parser.parse_args()
@@ -43,7 +43,6 @@ AOI        = args.aoi
 THRESHOLD  = args.threshold
 PATCH      = args.patch
 STRIDE     = args.stride
-IN_CH      = args.in_channels
 BATCH_SIZE = args.batch_size
 
 # -----------------------------------------
@@ -91,11 +90,15 @@ with rasterio.open(STACK) as src:
     meta   = src.meta.copy()
     H, W   = src.height, src.width
     nodata = src.nodata
+    stack_channels = src.count
 
 bands = img.shape[0]
 print(f"   Shape  : {img.shape}  (bands x H x W)")
 print(f"   Nodata : {nodata}")
 log.info(f"Stack loaded: shape={img.shape}")
+
+# Auto-detect in_channels from stack (or use checkpoint value later)
+IN_CH = args.in_channels if args.in_channels is not None else stack_channels
 
 # Nodata -> NaN, then per-band z-score
 if nodata is not None:
@@ -127,7 +130,7 @@ if isinstance(checkpoint, dict) and "model_state" in checkpoint:
     saved_thr   = saved_cfg.get("threshold",   THRESHOLD)
 
     if saved_ch != IN_CH:
-        print(f"   Checkpoint in_channels={saved_ch} -- overriding --in_channels {IN_CH}")
+        print(f"   Checkpoint in_channels={saved_ch} -- overriding to match checkpoint")
         IN_CH = saved_ch
 
     if args.threshold == 0.35 and saved_thr != 0.35:
@@ -148,7 +151,7 @@ print(f"   Threshold  : {THRESHOLD}")
 log.info(f"Model loaded: in_channels={IN_CH}, threshold={THRESHOLD}")
 
 # -----------------------------------------
-# PADDING (reflect -- avoids border artifacts)
+# PADDING
 # -----------------------------------------
 pad_h = (PATCH - H % PATCH) % PATCH
 pad_w = (PATCH - W % PATCH) % PATCH
@@ -165,7 +168,6 @@ H_pad, W_pad = img.shape[1], img.shape[2]
 pred_sum = np.zeros((H_pad, W_pad), dtype="float32")
 pred_cnt = np.zeros((H_pad, W_pad), dtype="float32")
 
-# Pre-collect all patch coordinates
 coords = [
     (i, j)
     for i in range(0, H_pad - PATCH + 1, STRIDE)

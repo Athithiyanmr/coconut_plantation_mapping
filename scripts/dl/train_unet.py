@@ -38,7 +38,7 @@ parser.add_argument("--lr",          type=float, default=1e-4, help="Learning ra
 parser.add_argument("--val_split",   type=float, default=0.2,  help="Validation split (default: 0.2)")
 parser.add_argument("--patience",    type=int,   default=6,    help="Early stopping patience (default: 6)")
 parser.add_argument("--threshold",   type=float, default=0.35, help="Binarization threshold (default: 0.35)")
-parser.add_argument("--in_channels", type=int,   default=11,   help="Input bands (default: 11)")
+parser.add_argument("--in_channels", type=int,   default=None, help="Input bands. Auto-detected from stack if omitted.")
 parser.add_argument("--workers",     type=int,   default=0,    help="DataLoader workers (default: 0 for macOS MPS)")
 args = parser.parse_args()
 
@@ -50,14 +50,27 @@ LR         = args.lr
 VAL_SPLIT  = args.val_split
 PATIENCE   = args.patience
 THRESHOLD  = args.threshold
-IN_CH      = args.in_channels
 
 MODEL_DIR  = Path("models")
 MODEL_DIR.mkdir(exist_ok=True)
 MODEL_PATH = MODEL_DIR / f"unet_{YEAR}_{AOI}.pth"
 BEST_CKPT  = MODEL_DIR / f"unet_{YEAR}_{AOI}_best.pth"
 
-log.info(f"Start: AOI={AOI}, year={YEAR}, epochs={EPOCHS}, batch={BATCH_SIZE}, lr={LR}")
+# Auto-detect in_channels from the stack file if not specified
+if args.in_channels is not None:
+    IN_CH = args.in_channels
+else:
+    import rasterio
+    stack_path = Path(f"data/processed/{AOI}/stack_{YEAR}.tif")
+    if stack_path.exists():
+        with rasterio.open(stack_path) as src:
+            IN_CH = src.count
+        print(f"   Auto-detected in_channels={IN_CH} from {stack_path}")
+    else:
+        IN_CH = 12  # default: 8 S2 bands + NDVI + EVI + NDMI + CanopyHeight
+        print(f"   Stack not found yet, defaulting to in_channels={IN_CH}")
+
+log.info(f"Start: AOI={AOI}, year={YEAR}, epochs={EPOCHS}, batch={BATCH_SIZE}, lr={LR}, in_channels={IN_CH}")
 
 # -----------------------------------------
 # DEVICE
@@ -112,7 +125,6 @@ class DiceLoss(nn.Module):
 
 class FocalLoss(nn.Module):
     def __init__(self, alpha=0.8, gamma=3.0):
-        """Focal loss with gamma=3.0 (increased from 2.0 for sparser coconut class)."""
         super().__init__()
         self.alpha = alpha
         self.gamma = gamma
@@ -167,6 +179,7 @@ if __name__ == "__main__":
     print(f"\nDataset   : {len(ds):,} patches")
     print(f"   Train     : {len(train_ds):,}")
     print(f"   Val       : {len(val_ds):,}")
+    print(f"   Channels  : {IN_CH}")
     log.info(f"Dataset: total={len(ds)}, train={len(train_ds)}, val={len(val_ds)}")
 
     # -----------------------------------------
