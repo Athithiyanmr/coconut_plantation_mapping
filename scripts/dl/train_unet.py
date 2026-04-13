@@ -8,6 +8,7 @@ import logging
 import json
 from pathlib import Path
 
+import numpy as np
 import torch
 from torch import nn, optim
 from torch.utils.data import DataLoader, random_split
@@ -39,6 +40,7 @@ parser.add_argument("--val_split",   type=float, default=0.2,  help="Validation 
 parser.add_argument("--patience",    type=int,   default=6,    help="Early stopping patience (default: 6)")
 parser.add_argument("--threshold",   type=float, default=0.35, help="Binarization threshold (default: 0.35)")
 parser.add_argument("--in_channels", type=int,   default=None, help="Input bands. Auto-detected from stack if omitted.")
+parser.add_argument("--pos_weight",  type=float, default=None, help="BCE pos_weight for FocalLoss. Auto-computed from masks if omitted.")
 parser.add_argument("--workers",     type=int,   default=0,    help="DataLoader workers (default: 0 for macOS MPS)")
 args = parser.parse_args()
 
@@ -67,7 +69,7 @@ else:
             IN_CH = src.count
         print(f"   Auto-detected in_channels={IN_CH} from {stack_path}")
     else:
-        IN_CH = 12  # default: 8 S2 bands + NDVI + EVI + NDMI + CanopyHeight
+        IN_CH = 12
         print(f"   Stack not found yet, defaulting to in_channels={IN_CH}")
 
 log.info(f"Start: AOI={AOI}, year={YEAR}, epochs={EPOCHS}, batch={BATCH_SIZE}, lr={LR}, in_channels={IN_CH}")
@@ -108,6 +110,33 @@ train_size = len(ds) - val_size
 train_ds, val_ds = random_split(ds, [train_size, val_size])
 
 # -----------------------------------------
+# COMPUTE pos_weight FROM TRAINING MASKS
+# pos_weight = neg_pixels / pos_pixels (pixel-level ratio across all train patches)
+# This tells BCE how much more to penalise missed coconut pixels vs background.
+# Even with balanced patches, coconut pixels inside each patch are still a minority.
+# -----------------------------------------
+if args.pos_weight is not None:
+    POS_WEIGHT = args.pos_weight
+else:
+    print("\nComputing pos_weight from training masks...")
+    pos_count = 0
+    neg_count = 0
+    for idx in train_ds.indices:
+        mask = np.load(mask_dir / f"mask_{idx:06d}.npy").astype(np.float32)
+        pos_count += int(mask.sum())
+        neg_count += int((mask == 0).sum())
+    if pos_count == 0:
+        POS_WEIGHT = 10.0
+        print(f"   WARNING: No positive pixels found -- using default pos_weight={POS_WEIGHT}")
+    else:
+        POS_WEIGHT = min(neg_count / pos_count, 50.0)  # cap at 50 to avoid instability
+        print(f"   pos pixels : {pos_count:,}")
+        print(f"   neg pixels : {neg_count:,}")
+        print(f"   pos_weight : {POS_WEIGHT:.1f}  (capped at 50)")
+
+log.info(f"pos_weight={POS_WEIGHT:.2f}")
+
+# -----------------------------------------
 # LOSS FUNCTIONS
 # -----------------------------------------
 class DiceLoss(nn.Module):
@@ -124,18 +153,31 @@ class DiceLoss(nn.Module):
         )
 
 class FocalLoss(nn.Module):
-    def __init__(self, alpha=0.8, gamma=3.0):
+    """
+    Focal loss with pos_weight applied to BCE.
+    pos_weight upweights the coconut (positive) class at the pixel level,
+    ensuring the model cannot ignore rare coconut pixels inside each patch.
+    gamma=2.0 focuses learning on hard examples.
+    """
+    def __init__(self, pos_weight: float = 1.0, gamma: float = 2.0):
         super().__init__()
-        self.alpha = alpha
-        self.gamma = gamma
+        self.gamma      = gamma
+        self.pos_weight = pos_weight
 
     def forward(self, preds, targets):
-        bce = nn.functional.binary_cross_entropy(preds, targets, reduction="none")
-        pt  = torch.exp(-bce)
-        return (self.alpha * (1 - pt) ** self.gamma * bce).mean()
+        pw  = torch.tensor(self.pos_weight, device=preds.device, dtype=preds.dtype)
+        bce = nn.functional.binary_cross_entropy_with_logits(
+            torch.logit(preds.clamp(1e-6, 1 - 1e-6)),
+            targets,
+            pos_weight=pw,
+            reduction="none",
+        )
+        pt = torch.exp(-bce)
+        return ((1 - pt) ** self.gamma * bce).mean()
 
-focal_loss = FocalLoss()
+
 dice_loss  = DiceLoss()
+focal_loss = FocalLoss(pos_weight=POS_WEIGHT, gamma=2.0)
 
 def combined_loss(pred, target):
     return focal_loss(pred, target) + dice_loss(pred, target)
@@ -180,6 +222,7 @@ if __name__ == "__main__":
     print(f"   Train     : {len(train_ds):,}")
     print(f"   Val       : {len(val_ds):,}")
     print(f"   Channels  : {IN_CH}")
+    print(f"   pos_weight: {POS_WEIGHT:.1f}")
     log.info(f"Dataset: total={len(ds)}, train={len(train_ds)}, val={len(val_ds)}")
 
     # -----------------------------------------
@@ -214,7 +257,7 @@ if __name__ == "__main__":
         train_loss = 0.0
 
         for x, y in tqdm(train_dl, desc=f"Epoch {epoch:02d}/{EPOCHS} [Train]", leave=False):
-            x, y = x.to(device), y.to(device)
+            x, y = x.to(device), y.float().to(device)
             optimizer.zero_grad()
             pred = model(x)
             loss = combined_loss(pred, y)
@@ -233,7 +276,7 @@ if __name__ == "__main__":
 
         with torch.no_grad():
             for x, y in val_dl:
-                x, y = x.to(device), y.to(device)
+                x, y = x.to(device), y.float().to(device)
                 pred  = model(x)
                 loss  = combined_loss(pred, y)
                 val_loss += loss.item()
@@ -286,6 +329,7 @@ if __name__ == "__main__":
                     "threshold":   THRESHOLD,
                     "aoi":         AOI,
                     "year":        YEAR,
+                    "pos_weight":  POS_WEIGHT,
                 }
             }, BEST_CKPT)
             print(f"  Best model saved (val_loss={val_loss:.4f})")
