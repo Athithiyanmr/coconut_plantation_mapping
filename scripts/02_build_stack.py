@@ -46,8 +46,6 @@ OUT_DIR.mkdir(parents=True, exist_ok=True)
 
 BANDS = ["B02", "B03", "B04", "B05", "B06", "B08", "B11", "B12"]
 
-# Band index labels for documentation
-# 8 raw Sentinel-2 bands + 3 vegetation indices + (optionally) canopy height
 BAND_NAMES = ["B02", "B03", "B04", "B05", "B06", "B08", "B11", "B12",
               "NDVI", "EVI", "NDMI"]
 if CANOPY_HEIGHT_PATH is not None:
@@ -68,9 +66,28 @@ if not ref_path.exists():
 with rasterio.open(ref_path) as ref:
     ref_arr  = ref.read(1).astype("float32")
     ref_meta = ref.meta.copy()
+    # FIX: Sentinel-2 L2A nodata is 0 in DN; treat it as NaN throughout.
+    # Using the file's nodata metadata is correct when set by 01_prepare_aoi_raw.py.
     nodata   = ref.nodata if ref.nodata is not None else 0
 
-log.info(f"Reference band loaded: shape={ref_arr.shape}, CRS={ref_meta['crs']}")
+log.info(f"Reference band loaded: shape={ref_arr.shape}, CRS={ref_meta['crs']}, nodata={nodata}")
+
+# FIX: build nodata mask BEFORE any scaling so we never
+# confuse a valid dark pixel with a padded/missing pixel.
+nodata_mask = (ref_arr == nodata)
+valid_px    = int(np.sum(~nodata_mask))
+total_px    = ref_arr.size
+print(f"\nNoData value  : {nodata}")
+print(f"Valid pixels  : {valid_px:,} / {total_px:,} ({100*valid_px/total_px:.1f}%)")
+log.info(f"Valid pixels: {valid_px}/{total_px} ({100*valid_px/total_px:.1f}%)")
+
+if valid_px / total_px < 0.50:
+    import warnings
+    warnings.warn(
+        f"WARNING: only {100*valid_px/total_px:.1f}% valid pixels in reference band.\n"
+        "This usually means nodata=0 is masking valid dark pixels.\n"
+        "Re-run 01_prepare_aoi_raw.py to regenerate clipped bands."
+    )
 
 # -----------------------------------------
 # LOAD + ALIGN ALL SENTINEL-2 BANDS
@@ -106,24 +123,20 @@ for band in BANDS[1:]:
 b2, b3, b4, b5, b6, b8, b11, b12 = arrays
 
 # -----------------------------------------
-# NODATA MASK
-# -----------------------------------------
-nodata_mask = (b2 == nodata)
-valid_px    = int(np.sum(~nodata_mask))
-total_px    = b2.size
-print(f"\nValid pixels : {valid_px:,} / {total_px:,} ({100*valid_px/total_px:.1f}%)")
-log.info(f"Valid pixels: {valid_px}/{total_px}")
-
-# -----------------------------------------
 # REFLECTANCE SCALING
 # Sentinel-2 L2A stores DN as uint16 scaled by 10000
+# FIX: set nodata pixels to NaN BEFORE clipping so 0-DN dark pixels
+# that are valid are not forced to NaN — only true nodata is masked.
 # -----------------------------------------
 SCALE = 10_000.0
 
 def scale(arr):
-    """Convert DN -> reflectance, clip to [0, 1], preserve nodata."""
-    scaled = np.where(arr == nodata, np.nan, arr / SCALE)
-    return np.clip(scaled, 0.0, 1.0)
+    """Convert DN -> reflectance [0,1]; true nodata -> NaN."""
+    out = arr.copy()
+    out[nodata_mask] = np.nan         # mask only true nodata
+    out = out / SCALE
+    out = np.clip(out, 0.0, 1.0)     # clip valid reflectances to [0,1]
+    return out
 
 b2s, b3s, b4s, b5s, b6s, b8s, b11s, b12s = [scale(b) for b in [b2, b3, b4, b5, b6, b8, b11, b12]]
 
@@ -137,18 +150,13 @@ evi  = 2.5 * (b8s - b4s) / (b8s + 6.0 * b4s - 7.5 * b2s + 1.0 + eps)
 ndmi = (b8s  - b11s) / (b8s  + b11s + eps)
 
 for name, arr in [("NDVI", ndvi), ("EVI", evi), ("NDMI", ndmi)]:
-    pct1, pct99 = np.nanpercentile(arr[~nodata_mask], [1, 99])
+    valid_vals = arr[~nodata_mask]
+    pct1, pct99 = np.nanpercentile(valid_vals, [1, 99])
     print(f"   {name:6s} range: [{pct1:.3f}, {pct99:.3f}]")
     log.info(f"{name} P1={pct1:.3f}, P99={pct99:.3f}")
 
 # -----------------------------------------
 # CANOPY HEIGHT BAND  (WRI / Meta, 1-m resolution)
-#
-# The canopy height tile is at 1m resolution — loading it all at once
-# into RAM causes OOM / SIGKILL.  Instead we keep the source file open
-# and use rasterio.band() to let rasterio stream+reproject block-by-block
-# directly onto the Sentinel-2 10m grid.  This avoids any large array
-# allocation at the native 1m resolution.
 # -----------------------------------------
 canopy_arr = None
 
@@ -169,8 +177,6 @@ if CANOPY_HEIGHT_PATH is not None:
     with rasterio.open(CANOPY_HEIGHT_PATH) as src:
         ch_nodata = src.nodata
 
-        # reproject streams block-by-block via rasterio.band() —
-        # the full 1m array is NEVER loaded into memory
         reproject(
             source=rasterio.band(src, 1),
             destination=canopy_arr,
@@ -179,19 +185,15 @@ if CANOPY_HEIGHT_PATH is not None:
             resampling=Resampling.bilinear,
         )
 
-    # Replace source nodata with NaN
     if ch_nodata is not None:
         canopy_arr = np.where(canopy_arr == ch_nodata, np.nan, canopy_arr)
 
-    # Apply same nodata mask as Sentinel-2 bands
     canopy_arr[nodata_mask] = np.nan
-
-    # Clip to physically plausible coconut palm heights: 0 – 45 m
     canopy_arr = np.clip(canopy_arr, 0.0, 45.0)
 
     ch_valid = canopy_arr[~nodata_mask & ~np.isnan(canopy_arr)]
     p1, p99  = np.nanpercentile(ch_valid, [1, 99])
-    print(f"   CanopyHt range: [{p1:.1f}, {p99:.1f}] m  (P1–P99)")
+    print(f"   CanopyHt range: [{p1:.1f}, {p99:.1f}] m  (P1-P99)")
     log.info(f"CanopyHeight P1={p1:.1f}m, P99={p99:.1f}m")
 
 # -----------------------------------------
@@ -202,6 +204,7 @@ if canopy_arr is not None:
     band_arrays.append(canopy_arr)
 
 stack = np.stack(band_arrays).astype("float32")
+# Apply nodata mask across all bands
 stack[:, nodata_mask] = np.nan
 
 # -----------------------------------------

@@ -29,9 +29,13 @@ parser.add_argument("--year",       required=True)
 parser.add_argument("--aoi",        required=True)
 parser.add_argument("--patch",      type=int,   default=128,  help="Patch size in pixels (default: 128)")
 parser.add_argument("--stride",     type=int,   default=64,   help="Stride between patches (default: 64)")
-parser.add_argument("--pos_ratio",  type=float, default=0.02, help="Min coconut ratio to keep as positive patch (default: 0.02)")
-parser.add_argument("--neg_sample", type=float, default=0.25, help="Keep probability for background patches (default: 0.25)")
-parser.add_argument("--dilate",     type=int,   default=1,    help="Dilation iterations on label mask (default: 1, 0=off)")
+# FIX: lower pos_ratio so we keep more coconut-containing patches
+# (0.10% coconut coverage means even 0.5% ratio gives us good signal)
+parser.add_argument("--pos_ratio",  type=float, default=0.005, help="Min coconut ratio to keep as positive patch (default: 0.005 = 0.5%%)")
+# FIX: increase neg_sample to keep more background context for the model
+parser.add_argument("--neg_sample", type=float, default=0.50, help="Keep probability for background patches (default: 0.50)")
+parser.add_argument("--nodata_tol", type=float, default=0.05, help="Max nodata fraction allowed in a patch (default: 0.05 = 5%%)")
+parser.add_argument("--dilate",     type=int,   default=2,    help="Dilation iterations on label mask (default: 2)")
 parser.add_argument("--seed",       type=int,   default=42,   help="Random seed for reproducibility (default: 42)")
 parser.add_argument("--clean",      action="store_true",      help="Delete old patches before running")
 args = parser.parse_args()
@@ -42,6 +46,7 @@ PATCH      = args.patch
 STRIDE     = args.stride
 POS_RATIO  = args.pos_ratio
 NEG_SAMPLE = args.neg_sample
+NODATA_TOL = args.nodata_tol
 SEED       = args.seed
 
 np.random.seed(SEED)
@@ -65,7 +70,7 @@ OUT_IMG.mkdir(parents=True, exist_ok=True)
 OUT_MSK.mkdir(parents=True, exist_ok=True)
 
 log.info(f"Start: AOI={AOI}, year={YEAR}, patch={PATCH}, stride={STRIDE}, "
-         f"pos_ratio={POS_RATIO}, neg_sample={NEG_SAMPLE}, seed={SEED}")
+         f"pos_ratio={POS_RATIO}, neg_sample={NEG_SAMPLE}, nodata_tol={NODATA_TOL}, seed={SEED}")
 
 # -----------------------------------------
 # STEP 1 -- LOAD STACK
@@ -85,13 +90,21 @@ log.info(f"Stack loaded: shape={img.shape}, nodata={nodata}")
 
 # -----------------------------------------
 # STEP 2 -- NODATA -> NaN
+# FIX: handle both explicit nodata value and NaN (float32 stacks use NaN)
 # -----------------------------------------
-if nodata is not None:
+if nodata is not None and not np.isnan(nodata):
     img[img == nodata] = np.nan
+# NaN already NaN — no action needed
+
+# Report coverage
+nan_frac = np.isnan(img[0]).mean()
+print(f"   NaN fraction  : {100*nan_frac:.1f}%  (band 0 / B02)")
+if nan_frac > 0.50:
+    print("   WARNING: >50% of stack is NaN. Re-run 01_prepare_aoi_raw.py + 02_build_stack.py.")
 
 # -----------------------------------------
 # STEP 3 -- PER-BAND NORMALISATION
-# z-score on valid pixels only -- model-ready patches
+# z-score on valid pixels only
 # -----------------------------------------
 print("Normalising bands...")
 for b in range(img.shape[0]):
@@ -140,11 +153,14 @@ if coconut_total == 0:
 
 # -----------------------------------------
 # STEP 5 -- EDGE DILATION
+# FIX: default dilate=2 gives more positive pixels for sparse coconut labels
 # -----------------------------------------
 if args.dilate > 0:
     print(f"   Dilating mask ({args.dilate} iteration(s))...")
     label_mask = binary_dilation(label_mask, iterations=args.dilate).astype("uint8")
-    log.info(f"Dilation: iterations={args.dilate}")
+    dilated_total = label_mask.sum()
+    print(f"   After dilation : {dilated_total:,} coconut pixels")
+    log.info(f"Dilation: iterations={args.dilate}, pixels after={dilated_total}")
 
 # -----------------------------------------
 # STEP 6 -- PATCH GENERATION
@@ -160,8 +176,9 @@ total_j = len(range(0, W - PATCH + 1, STRIDE))
 
 print(f"\nPatch config : {PATCH}x{PATCH} px, stride={STRIDE}")
 print(f"   Grid         : {total_i} x {total_j} = {total_i * total_j:,} candidates")
-print(f"   Pos ratio    : >= {POS_RATIO*100:.1f}%% coconut -> always keep")
+print(f"   Pos ratio    : >= {POS_RATIO*100:.2f}%% coconut -> always keep")
 print(f"   Neg sample   : {NEG_SAMPLE*100:.0f}%% of background patches kept")
+print(f"   NoData tol   : skip patch if >{NODATA_TOL*100:.0f}%% NaN pixels")
 
 pbar = tqdm(total=total_i * total_j, unit="patch")
 
@@ -172,17 +189,15 @@ for i in range(0, H - PATCH + 1, STRIDE):
         x = img[:, i:i+PATCH, j:j+PATCH]
         y = label_mask[i:i+PATCH, j:j+PATCH]
 
-        # Shape guard
         if x.shape[1:] != (PATCH, PATCH):
             continue
 
-        # Skip patches with >10%% nodata
+        # FIX: use configurable nodata_tol (default 5%) instead of hard-coded 10%
         nan_ratio = np.isnan(x).mean()
-        if nan_ratio > 0.10:
+        if nan_ratio > NODATA_TOL:
             skipped_nodata += 1
             continue
 
-        # Fill remaining NaN with 0 before saving
         x = np.nan_to_num(x, nan=0.0)
 
         # -----------------------------------------
