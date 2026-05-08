@@ -27,6 +27,13 @@ parser = argparse.ArgumentParser()
 parser.add_argument("--aoi", required=True)
 parser.add_argument("--year", required=True)
 parser.add_argument("--target_crs", default="EPSG:32643")
+parser.add_argument(
+    "--min_valid",
+    type=float,
+    default=0.30,
+    help="Minimum valid-pixel fraction (0–1) for a tile to be included in the merge. "
+         "Tiles below this threshold are skipped. Default: 0.30 (30%%)",
+)
 args = parser.parse_args()
 
 AOI_PATH   = f"data/raw/boundaries/{args.aoi}.shp"
@@ -37,16 +44,15 @@ BANDS      = ["B02", "B03", "B04", "B05", "B06", "B08", "B11", "B12", "SCL"]
 TARGET_CRS = args.target_crs
 
 # Sentinel-2 L2A: 0 is the true nodata sentinel
-# We keep it as the nodata value in the GeoTIFF metadata so rasterio
-# and downstream scripts can detect it, but we do NOT use it as the
-# merge fill value so valid dark pixels (water, shadow) are preserved.
-S2_NODATA = 0
+S2_NODATA  = 0
+MIN_VALID  = args.min_valid
 
 OUT_DIR.mkdir(parents=True, exist_ok=True)
 
-print(f"\nAOI  : {args.aoi}")
-print(f"Year : {args.year}")
-print(f"CRS  : {TARGET_CRS}")
+print(f"\nAOI      : {args.aoi}")
+print(f"Year     : {args.year}")
+print(f"CRS      : {TARGET_CRS}")
+print(f"Min valid: {MIN_VALID*100:.0f}%  (tiles below this are skipped)")
 
 # -----------------------------------------
 # LOAD AOI
@@ -57,6 +63,7 @@ if aoi.crs is None:
 
 # -----------------------------------------
 # REPROJECT FUNCTION
+# Returns (dataset, valid_fraction) — dataset is None if tile is skipped
 # -----------------------------------------
 def reproject_tile(src, target_crs):
     transform, width, height = calculate_default_transform(
@@ -89,10 +96,12 @@ def reproject_tile(src, target_crs):
             dst_nodata=S2_NODATA,
         )
 
+    valid_frac = float(np.sum(dst_array[0] != S2_NODATA)) / dst_array[0].size
+
     memfile = rasterio.io.MemoryFile()
     dataset = memfile.open(**kwargs)
     dataset.write(dst_array)
-    return dataset
+    return dataset, valid_frac
 
 # -----------------------------------------
 # PROCESS BANDS
@@ -107,23 +116,55 @@ for band in BANDS:
     print(f"\nProcessing {band} ({len(band_files)} tiles)")
 
     reprojected_srcs = []
+    skipped_tiles    = []
+
     for f in band_files:
         src = rasterio.open(f)
+
         if str(src.crs) != TARGET_CRS:
-            print(f"   Reprojecting {f.name}")
-            reproj = reproject_tile(src, TARGET_CRS)
+            print(f"   Reprojecting {f.parent.name}/{f.name} ...")
+            reproj, valid_frac = reproject_tile(src, TARGET_CRS)
+            print(f"   Valid after reproject : {100*valid_frac:.1f}%  ({f.parent.name})")
+
+            if valid_frac < MIN_VALID:
+                print(f"   \u26a0\ufe0f  SKIPPING {f.parent.name} — only {100*valid_frac:.1f}% valid "
+                      f"(threshold: {MIN_VALID*100:.0f}%)")
+                log.warning(f"Skipped tile {f.parent.name}: valid_frac={valid_frac:.3f} < {MIN_VALID}")
+                reproj.close()
+                skipped_tiles.append(f.parent.name)
+                continue
+
             reprojected_srcs.append(reproj)
         else:
+            arr        = src.read(1)
+            valid_frac = float(np.sum(arr != S2_NODATA)) / arr.size
+            print(f"   Valid (native CRS)    : {100*valid_frac:.1f}%  ({f.parent.name})")
+
+            if valid_frac < MIN_VALID:
+                print(f"   \u26a0\ufe0f  SKIPPING {f.parent.name} — only {100*valid_frac:.1f}% valid "
+                      f"(threshold: {MIN_VALID*100:.0f}%)")
+                log.warning(f"Skipped tile {f.parent.name}: valid_frac={valid_frac:.3f} < {MIN_VALID}")
+                skipped_tiles.append(f.parent.name)
+                src.close()
+                continue
+
             reprojected_srcs.append(src)
+
+    if not reprojected_srcs:
+        print(f"   \u274c All tiles skipped for {band} — no valid data. Lowering --min_valid may help.")
+        log.error(f"{band}: all tiles skipped (min_valid={MIN_VALID})")
+        continue
+
+    if skipped_tiles:
+        print(f"   Tiles used  : {len(reprojected_srcs)}  |  Skipped: {skipped_tiles}")
+    else:
+        print(f"   Tiles used  : {len(reprojected_srcs)}")
 
     # -----------------------------------------
     # MERGE
-    # FIX: use nodata=S2_NODATA so tiles are stitched correctly;
-    #      valid dark pixels (DN > 0) are never masked out.
     # -----------------------------------------
     mosaic, transform = merge(reprojected_srcs, nodata=S2_NODATA)
 
-    # Report valid pixel coverage after merge
     valid_px = int(np.sum(mosaic[0] != S2_NODATA))
     total_px = mosaic[0].size
     print(f"   Mosaic valid   : {valid_px:,} / {total_px:,} ({100*valid_px/total_px:.1f}%)")
@@ -140,8 +181,6 @@ for band in BANDS:
 
     # -----------------------------------------
     # CLIP
-    # FIX: same nodata value; crop=True, filled=True so outside-AOI
-    #      pixels are set to S2_NODATA (not 0 overwriting valid data)
     # -----------------------------------------
     aoi_proj = aoi.to_crs(meta["crs"])
     geoms    = list(aoi_proj.geometry)
@@ -158,7 +197,6 @@ for band in BANDS:
                 filled=True,
             )
 
-    # Report valid pixel coverage after clip
     valid_clip = int(np.sum(clipped[0] != S2_NODATA))
     total_clip = clipped[0].size
     print(f"   Clipped valid  : {valid_clip:,} / {total_clip:,} ({100*valid_clip/total_clip:.1f}%)")
