@@ -38,7 +38,7 @@ CLOUD = args.cloud
 OUT = Path("data/raw/sentinel2") / args.aoi / str(YEAR)
 OUT.mkdir(parents=True, exist_ok=True)
 
-# SCL is included so 01_prepare_aoi_raw.py can mask clouds/shadows
+# SCL included for cloud masking in 01_prepare_aoi_raw.py
 BANDS = ["B02", "B03", "B04", "B05", "B06", "B08", "B11", "B12", "SCL"]
 
 # -----------------------------------------
@@ -77,13 +77,25 @@ def download(url, out_path):
 
 # -----------------------------------------
 # SCENE SCORING
-# Primary  : s2:nodata_pixel_percentage ASC (full tile pass first)
-# Secondary: eo:cloud_cover ASC (least cloud)
+#
+# Problem: all full-tile scenes have nodata between 0.9-1.9%% -- tiny
+# differences that cause wrong ordering when sorting by raw nodata%%.
+# Example: July (nodata=0.90%%, cloud=11%%) beats October (nodata=1.16%%, cloud=0.02%%)
+# even though October is clearly better.
+#
+# Fix: bucket nodata into 5%% bins so any scene with nodata < 5%% is
+# treated as "full tile" and sorted purely by cloud cover within that group.
+#   bucket 0  = nodata  0- 5%%  -> full tile, sort by cloud only
+#   bucket 1  = nodata  5-10%%  -> partial, deprioritised
+#   bucket 10 = nodata 50-55%%  -> very partial, last resort
 # -----------------------------------------
+BUCKET_SIZE = 5.0
+
 def scene_score(item):
-    nodata_pct = item.properties.get("s2:nodata_pixel_percentage", 100.0)
-    cloud_pct  = item.properties.get("eo:cloud_cover",             100.0)
-    return (nodata_pct, cloud_pct)
+    nodata_pct    = item.properties.get("s2:nodata_pixel_percentage", 100.0)
+    cloud_pct     = item.properties.get("eo:cloud_cover",             100.0)
+    nodata_bucket = int(nodata_pct / BUCKET_SIZE)
+    return (nodata_bucket, cloud_pct)
 
 # -----------------------------------------
 # LOAD AOI
@@ -150,7 +162,7 @@ for tile, tile_items in by_tile.items():
     print(f"   NoData : {nodata_pct}%%")
 
     if isinstance(nodata_pct, float) and nodata_pct > 50.0:
-        print(f"   WARNING: {nodata_pct:.1f}%% nodata -- partial orbit pass, coverage will be low.")
+        print(f"   WARNING: {nodata_pct:.1f}%% nodata -- partial orbit pass.")
         log.warning(f"Tile {tile}: high nodata {nodata_pct:.1f}%%")
 
     downloaded_bands = []
