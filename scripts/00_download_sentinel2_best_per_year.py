@@ -38,10 +38,11 @@ CLOUD = args.cloud
 OUT = Path("data/raw/sentinel2") / args.aoi / str(YEAR)
 OUT.mkdir(parents=True, exist_ok=True)
 
-BANDS = ["B02", "B03", "B04", "B05", "B06", "B08", "B11", "B12"]
+# SCL is included so 01_prepare_aoi_raw.py can mask clouds/shadows
+BANDS = ["B02", "B03", "B04", "B05", "B06", "B08", "B11", "B12", "SCL"]
 
 # -----------------------------------------
-# SAFE DOWNLOAD (retry + progress + corruption check)
+# SAFE DOWNLOAD
 # -----------------------------------------
 @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=2, min=4, max=30))
 def download(url, out_path):
@@ -62,7 +63,7 @@ def download(url, out_path):
                         f.write(chunk)
                         bar.update(len(chunk))
 
-        if tmp.stat().st_size < 5_000_000:
+        if tmp.stat().st_size < 1_000_000:
             tmp.unlink(missing_ok=True)
             raise RuntimeError(f"Corrupted download: {out_path.name}")
 
@@ -76,10 +77,8 @@ def download(url, out_path):
 
 # -----------------------------------------
 # SCENE SCORING
-# Primary key : s2:nodata_pixel_percentage ascending (least nodata = full tile)
-# Secondary   : eo:cloud_cover ascending (least cloud)
-# This avoids partial-orbit acquisitions where only 20%% of the tile
-# is covered even though cloud cover is reported as 0%%.
+# Primary  : s2:nodata_pixel_percentage ASC (full tile pass first)
+# Secondary: eo:cloud_cover ASC (least cloud)
 # -----------------------------------------
 def scene_score(item):
     nodata_pct = item.properties.get("s2:nodata_pixel_percentage", 100.0)
@@ -124,7 +123,6 @@ log.info(f"Found {len(items)} scenes")
 # GROUP BY TILE
 # -----------------------------------------
 by_tile = defaultdict(list)
-
 for item in items:
     tile = item.properties.get("s2:mgrs_tile")
     if tile:
@@ -139,9 +137,7 @@ manifest = []
 
 for tile, tile_items in by_tile.items():
 
-    # Sort: least nodata first, then least cloud
-    best = sorted(tile_items, key=scene_score)[0]
-
+    best       = sorted(tile_items, key=scene_score)[0]
     nodata_pct = best.properties.get("s2:nodata_pixel_percentage", "n/a")
     cloud_pct  = best.properties.get("eo:cloud_cover", "n/a")
 
@@ -151,13 +147,11 @@ for tile, tile_items in by_tile.items():
     print(f"\n   Tile   : {tile}")
     print(f"   Date   : {best.datetime}")
     print(f"   Cloud  : {cloud_pct}%%")
-    print(f"   NoData : {nodata_pct}%%  (tile coverage check)")
+    print(f"   NoData : {nodata_pct}%%")
 
     if isinstance(nodata_pct, float) and nodata_pct > 50.0:
-        print(f"   WARNING: selected scene has {nodata_pct:.1f}%% nodata — "
-              "tile may be a partial orbit pass. "
-              "Coverage will be low for this tile.")
-        log.warning(f"Tile {tile}: high nodata {nodata_pct:.1f}%% in best scene")
+        print(f"   WARNING: {nodata_pct:.1f}%% nodata -- partial orbit pass, coverage will be low.")
+        log.warning(f"Tile {tile}: high nodata {nodata_pct:.1f}%%")
 
     downloaded_bands = []
 
