@@ -72,7 +72,19 @@ def download(url, out_path):
     except Exception as e:
         log.error(f"Failed: {out_path.name} -- {e}")
         tmp.unlink(missing_ok=True)
-        raise  # re-raise so tenacity can retry
+        raise
+
+# -----------------------------------------
+# SCENE SCORING
+# Primary key : s2:nodata_pixel_percentage ascending (least nodata = full tile)
+# Secondary   : eo:cloud_cover ascending (least cloud)
+# This avoids partial-orbit acquisitions where only 20%% of the tile
+# is covered even though cloud cover is reported as 0%%.
+# -----------------------------------------
+def scene_score(item):
+    nodata_pct = item.properties.get("s2:nodata_pixel_percentage", 100.0)
+    cloud_pct  = item.properties.get("eo:cloud_cover",             100.0)
+    return (nodata_pct, cloud_pct)
 
 # -----------------------------------------
 # LOAD AOI
@@ -83,7 +95,7 @@ geom = aoi.geometry.iloc[0].__geo_interface__
 log.info(f"AOI loaded: {AOI}")
 
 # -----------------------------------------
-# OPEN STAC (auto-sign all assets)
+# OPEN STAC
 # -----------------------------------------
 catalog = pystac_client.Client.open(
     "https://planetarycomputer.microsoft.com/api/stac/v1",
@@ -127,17 +139,25 @@ manifest = []
 
 for tile, tile_items in by_tile.items():
 
-    best = sorted(
-        tile_items,
-        key=lambda x: x.properties.get("eo:cloud_cover", 100)
-    )[0]
+    # Sort: least nodata first, then least cloud
+    best = sorted(tile_items, key=scene_score)[0]
+
+    nodata_pct = best.properties.get("s2:nodata_pixel_percentage", "n/a")
+    cloud_pct  = best.properties.get("eo:cloud_cover", "n/a")
 
     tile_dir = OUT / f"T{tile}"
     tile_dir.mkdir(parents=True, exist_ok=True)
 
-    print(f"\n   Tile  : {tile}")
-    print(f"   Cloud : {best.properties['eo:cloud_cover']}%%")
-    print(f"   Date  : {best.datetime}")
+    print(f"\n   Tile   : {tile}")
+    print(f"   Date   : {best.datetime}")
+    print(f"   Cloud  : {cloud_pct}%%")
+    print(f"   NoData : {nodata_pct}%%  (tile coverage check)")
+
+    if isinstance(nodata_pct, float) and nodata_pct > 50.0:
+        print(f"   WARNING: selected scene has {nodata_pct:.1f}%% nodata — "
+              "tile may be a partial orbit pass. "
+              "Coverage will be low for this tile.")
+        log.warning(f"Tile {tile}: high nodata {nodata_pct:.1f}%% in best scene")
 
     downloaded_bands = []
 
@@ -159,12 +179,12 @@ for tile, tile_items in by_tile.items():
         download(asset.href, out_file)
         downloaded_bands.append(band)
 
-    # Record to manifest
     manifest.append({
-        "tile":         tile,
-        "date":         str(best.datetime),
-        "cloud_cover":  best.properties["eo:cloud_cover"],
-        "bands":        downloaded_bands,
+        "tile":          tile,
+        "date":          str(best.datetime),
+        "cloud_cover":   cloud_pct,
+        "nodata_pct":    nodata_pct,
+        "bands":         downloaded_bands,
         "downloaded_at": datetime.utcnow().isoformat(),
     })
 
