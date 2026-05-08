@@ -11,7 +11,7 @@ from pathlib import Path
 import numpy as np
 import torch
 from torch import nn, optim
-from torch.utils.data import DataLoader, random_split
+from torch.utils.data import DataLoader, Subset
 from tqdm import tqdm
 
 from scripts.dl.dataset import CoconutDataset
@@ -40,7 +40,7 @@ parser.add_argument("--val_split",   type=float, default=0.2,  help="Validation 
 parser.add_argument("--patience",    type=int,   default=6,    help="Early stopping patience (default: 6)")
 parser.add_argument("--threshold",   type=float, default=0.35, help="Binarization threshold (default: 0.35)")
 parser.add_argument("--in_channels", type=int,   default=None, help="Input bands. Auto-detected from stack if omitted.")
-parser.add_argument("--pos_weight",  type=float, default=None, help="BCE pos_weight for FocalLoss. Auto-computed from masks if omitted.")
+parser.add_argument("--pos_weight",  type=float, default=None, help="BCE pos_weight. Auto-computed from masks if omitted.")
 parser.add_argument("--workers",     type=int,   default=0,    help="DataLoader workers (default: 0 for macOS MPS)")
 args = parser.parse_args()
 
@@ -58,7 +58,7 @@ MODEL_DIR.mkdir(exist_ok=True)
 MODEL_PATH = MODEL_DIR / f"unet_{YEAR}_{AOI}.pth"
 BEST_CKPT  = MODEL_DIR / f"unet_{YEAR}_{AOI}_best.pth"
 
-# Auto-detect in_channels from the stack file if not specified
+# Auto-detect in_channels
 if args.in_channels is not None:
     IN_CH = args.in_channels
 else:
@@ -70,7 +70,7 @@ else:
         print(f"   Auto-detected in_channels={IN_CH} from {stack_path}")
     else:
         IN_CH = 12
-        print(f"   Stack not found yet, defaulting to in_channels={IN_CH}")
+        print(f"   Stack not found, defaulting to in_channels={IN_CH}")
 
 log.info(f"Start: AOI={AOI}, year={YEAR}, epochs={EPOCHS}, batch={BATCH_SIZE}, lr={LR}, in_channels={IN_CH}")
 
@@ -89,6 +89,8 @@ log.info(f"Device: {device}")
 
 # -----------------------------------------
 # DATASET
+# Train split  : augmentation ON
+# Val split    : augmentation OFF  (deterministic evaluation)
 # -----------------------------------------
 img_dir  = Path(f"data/dl/{YEAR}_{AOI}/images")
 mask_dir = Path(f"data/dl/{YEAR}_{AOI}/masks")
@@ -99,29 +101,36 @@ if not img_dir.exists() or not mask_dir.exists():
         "Run make_patches.py first."
     )
 
-ds = CoconutDataset(img_dir, mask_dir)
-
-if len(ds) == 0:
+# Full dataset with augment=False just for length / splitting
+ds_full = CoconutDataset(img_dir, mask_dir, augment=False)
+n       = len(ds_full)
+if n == 0:
     raise RuntimeError("Dataset is empty -- check make_patches.py output.")
 
 torch.manual_seed(42)
-val_size   = int(len(ds) * VAL_SPLIT)
-train_size = len(ds) - val_size
-train_ds, val_ds = random_split(ds, [train_size, val_size])
+all_idx   = torch.randperm(n).tolist()
+val_size  = int(n * VAL_SPLIT)
+train_idx = all_idx[val_size:]
+val_idx   = all_idx[:val_size]
+
+# Separate dataset objects so augmentation only applies to train
+ds_train = CoconutDataset(img_dir, mask_dir, augment=True)
+ds_val   = CoconutDataset(img_dir, mask_dir, augment=False)
+
+train_ds = Subset(ds_train, train_idx)
+val_ds   = Subset(ds_val,   val_idx)
 
 # -----------------------------------------
 # COMPUTE pos_weight FROM TRAINING MASKS
-# pos_weight = neg_pixels / pos_pixels (pixel-level ratio across all train patches)
-# This tells BCE how much more to penalise missed coconut pixels vs background.
-# Even with balanced patches, coconut pixels inside each patch are still a minority.
+# neg/pos pixel ratio across all training patches.
+# Capped at 50 to avoid loss instability.
 # -----------------------------------------
 if args.pos_weight is not None:
     POS_WEIGHT = args.pos_weight
 else:
     print("\nComputing pos_weight from training masks...")
-    pos_count = 0
-    neg_count = 0
-    for idx in train_ds.indices:
+    pos_count, neg_count = 0, 0
+    for idx in train_idx:
         mask = np.load(mask_dir / f"mask_{idx:06d}.npy").astype(np.float32)
         pos_count += int(mask.sum())
         neg_count += int((mask == 0).sum())
@@ -129,7 +138,7 @@ else:
         POS_WEIGHT = 10.0
         print(f"   WARNING: No positive pixels found -- using default pos_weight={POS_WEIGHT}")
     else:
-        POS_WEIGHT = min(neg_count / pos_count, 50.0)  # cap at 50 to avoid instability
+        POS_WEIGHT = min(neg_count / pos_count, 50.0)
         print(f"   pos pixels : {pos_count:,}")
         print(f"   neg pixels : {neg_count:,}")
         print(f"   pos_weight : {POS_WEIGHT:.1f}  (capped at 50)")
@@ -138,39 +147,40 @@ log.info(f"pos_weight={POS_WEIGHT:.2f}")
 
 # -----------------------------------------
 # LOSS FUNCTIONS
+# Model now returns RAW LOGITS (sigmoid removed from forward()).
+# FocalLoss uses binary_cross_entropy_with_logits directly.
+# DiceLoss applies sigmoid internally.
 # -----------------------------------------
 class DiceLoss(nn.Module):
     def __init__(self, smooth=1e-6):
         super().__init__()
         self.smooth = smooth
 
-    def forward(self, preds, targets):
+    def forward(self, logits, targets):
+        preds   = torch.sigmoid(logits)   # sigmoid here only for Dice
         preds   = preds.view(-1)
         targets = targets.view(-1)
-        intersection = (preds * targets).sum()
-        return 1 - (2 * intersection + self.smooth) / (
+        inter   = (preds * targets).sum()
+        return 1 - (2 * inter + self.smooth) / (
             preds.sum() + targets.sum() + self.smooth
         )
 
+
 class FocalLoss(nn.Module):
     """
-    Focal loss with pos_weight applied to BCE.
-    pos_weight upweights the coconut (positive) class at the pixel level,
-    ensuring the model cannot ignore rare coconut pixels inside each patch.
-    gamma=2.0 focuses learning on hard examples.
+    Focal loss directly on raw logits via BCEWithLogitsLoss.
+    pos_weight penalises missed coconut pixels.
+    gamma focuses on hard examples.
     """
     def __init__(self, pos_weight: float = 1.0, gamma: float = 2.0):
         super().__init__()
         self.gamma      = gamma
         self.pos_weight = pos_weight
 
-    def forward(self, preds, targets):
-        pw  = torch.tensor(self.pos_weight, device=preds.device, dtype=preds.dtype)
+    def forward(self, logits, targets):
+        pw  = torch.tensor(self.pos_weight, device=logits.device, dtype=logits.dtype)
         bce = nn.functional.binary_cross_entropy_with_logits(
-            torch.logit(preds.clamp(1e-6, 1 - 1e-6)),
-            targets,
-            pos_weight=pw,
-            reduction="none",
+            logits, targets, pos_weight=pw, reduction="none"
         )
         pt = torch.exp(-bce)
         return ((1 - pt) ** self.gamma * bce).mean()
@@ -179,22 +189,25 @@ class FocalLoss(nn.Module):
 dice_loss  = DiceLoss()
 focal_loss = FocalLoss(pos_weight=POS_WEIGHT, gamma=2.0)
 
-def combined_loss(pred, target):
-    return focal_loss(pred, target) + dice_loss(pred, target)
+def combined_loss(logits, targets):
+    return focal_loss(logits, targets) + dice_loss(logits, targets)
+
 
 # -----------------------------------------
-# METRICS
+# METRICS  (operate on sigmoid probabilities)
 # -----------------------------------------
-def compute_metrics(pred, target, threshold):
-    pred_bin     = (pred > threshold).float()
-    intersection = (pred_bin * target).sum()
-    union        = pred_bin.sum() + target.sum() - intersection
-    iou          = (intersection / (union + 1e-6)).item()
-    tp = (pred_bin * target).sum().item()
-    fp = (pred_bin * (1 - target)).sum().item()
-    fn = ((1 - pred_bin) * target).sum().item()
+def compute_metrics(logits, targets, threshold):
+    pred_prob = torch.sigmoid(logits)
+    pred_bin  = (pred_prob > threshold).float()
+    inter     = (pred_bin * targets).sum()
+    union     = pred_bin.sum() + targets.sum() - inter
+    iou       = (inter / (union + 1e-6)).item()
+    tp = (pred_bin * targets).sum().item()
+    fp = (pred_bin * (1 - targets)).sum().item()
+    fn = ((1 - pred_bin) * targets).sum().item()
     f1 = (2 * tp) / (2 * tp + fp + fn + 1e-6)
     return iou, f1
+
 
 # -----------------------------------------
 # MAIN GUARD
@@ -204,44 +217,31 @@ if __name__ == "__main__":
     pin = (device.type == "cuda")
 
     train_dl = DataLoader(
-        train_ds,
-        batch_size=BATCH_SIZE,
-        shuffle=True,
-        num_workers=args.workers,
-        pin_memory=pin,
+        train_ds, batch_size=BATCH_SIZE, shuffle=True,
+        num_workers=args.workers, pin_memory=pin,
     )
     val_dl = DataLoader(
-        val_ds,
-        batch_size=BATCH_SIZE,
-        shuffle=False,
-        num_workers=args.workers,
-        pin_memory=pin,
+        val_ds, batch_size=BATCH_SIZE, shuffle=False,
+        num_workers=args.workers, pin_memory=pin,
     )
 
-    print(f"\nDataset   : {len(ds):,} patches")
-    print(f"   Train     : {len(train_ds):,}")
-    print(f"   Val       : {len(val_ds):,}")
+    print(f"\nDataset   : {n:,} patches")
+    print(f"   Train     : {len(train_ds):,}  (augmentation ON)")
+    print(f"   Val       : {len(val_ds):,}  (augmentation OFF)")
     print(f"   Channels  : {IN_CH}")
     print(f"   pos_weight: {POS_WEIGHT:.1f}")
-    log.info(f"Dataset: total={len(ds)}, train={len(train_ds)}, val={len(val_ds)}")
+    log.info(f"Dataset: total={n}, train={len(train_ds)}, val={len(val_ds)}")
 
-    # -----------------------------------------
     # MODEL
-    # -----------------------------------------
     model = UNetTransformer(in_channels=IN_CH).to(device)
     total_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(f"   Parameters: {total_params:,}")
     log.info(f"Model: UNetTransformer, params={total_params}, in_channels={IN_CH}")
 
-    # -----------------------------------------
-    # OPTIMIZER + SCHEDULER
-    # -----------------------------------------
+    # OPTIMISER + SCHEDULER
     optimizer = optim.AdamW(model.parameters(), lr=LR, weight_decay=1e-4)
     scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=EPOCHS, eta_min=1e-6)
 
-    # -----------------------------------------
-    # TRAINING LOOP
-    # -----------------------------------------
     best_val_loss    = float("inf")
     patience_counter = 0
     history          = []
@@ -252,35 +252,32 @@ if __name__ == "__main__":
 
     for epoch in range(1, EPOCHS + 1):
 
-        # TRAIN
+        # ---- TRAIN ----
         model.train()
         train_loss = 0.0
-
         for x, y in tqdm(train_dl, desc=f"Epoch {epoch:02d}/{EPOCHS} [Train]", leave=False):
             x, y = x.to(device), y.float().to(device)
             optimizer.zero_grad()
-            pred = model(x)
-            loss = combined_loss(pred, y)
+            logits = model(x)
+            loss   = combined_loss(logits, y)
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             optimizer.step()
             train_loss += loss.item()
-
         train_loss /= len(train_dl)
 
-        # VALIDATION
+        # ---- VALIDATION ----
         model.eval()
         val_loss  = 0.0
         total_iou = 0.0
         total_f1  = 0.0
-
         with torch.no_grad():
             for x, y in val_dl:
-                x, y = x.to(device), y.float().to(device)
-                pred  = model(x)
-                loss  = combined_loss(pred, y)
+                x, y   = x.to(device), y.float().to(device)
+                logits  = model(x)
+                loss    = combined_loss(logits, y)
                 val_loss += loss.item()
-                iou, f1   = compute_metrics(pred, y, THRESHOLD)
+                iou, f1  = compute_metrics(logits, y, THRESHOLD)
                 total_iou += iou
                 total_f1  += f1
 
@@ -288,7 +285,6 @@ if __name__ == "__main__":
         avg_iou    = total_iou / len(val_dl)
         avg_f1     = total_f1  / len(val_dl)
         current_lr = optimizer.param_groups[0]["lr"]
-
         scheduler.step()
 
         print(
@@ -313,7 +309,6 @@ if __name__ == "__main__":
             "lr":         current_lr,
         })
 
-        # BEST CHECKPOINT
         if val_loss < best_val_loss:
             best_val_loss    = val_loss
             patience_counter = 0
@@ -334,7 +329,6 @@ if __name__ == "__main__":
             }, BEST_CKPT)
             print(f"  Best model saved (val_loss={val_loss:.4f})")
             log.info(f"Best checkpoint: epoch={epoch}, val_loss={val_loss:.4f}")
-
         else:
             patience_counter += 1
             print(f"  No improvement ({patience_counter}/{PATIENCE})")
@@ -343,7 +337,6 @@ if __name__ == "__main__":
                 log.info(f"Early stopping at epoch {epoch}")
                 break
 
-        # LATEST CHECKPOINT (every epoch)
         torch.save({
             "epoch":       epoch,
             "model_state": model.state_dict(),
@@ -351,17 +344,11 @@ if __name__ == "__main__":
             "val_loss":    val_loss,
         }, MODEL_PATH)
 
-    # -----------------------------------------
-    # SAVE HISTORY
-    # -----------------------------------------
     history_path = MODEL_DIR / f"history_{YEAR}_{AOI}.json"
     with open(history_path, "w") as f:
         json.dump(history, f, indent=2)
     print(f"\nHistory saved -> {history_path}")
 
-    # -----------------------------------------
-    # FINAL SUMMARY
-    # -----------------------------------------
     best = max(history, key=lambda x: x["iou"])
     print(f"\n{'='*55}")
     print(f"Training complete")
