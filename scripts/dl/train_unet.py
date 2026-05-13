@@ -1,7 +1,7 @@
 # scripts/dl/train_unet.py
 #
 # Trains UNet-Transformer for coconut plantation segmentation.
-# Supports ignore mask (255) — pixels with label=255 are excluded from loss.
+# Supports ignore mask (255) -- pixels with label=255 are excluded from loss.
 
 import os
 os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
@@ -34,17 +34,19 @@ log = logging.getLogger(__name__)
 # ARGUMENTS
 # -----------------------------------------
 parser = argparse.ArgumentParser(description="Train UNet-Transformer for coconut plantation segmentation")
-parser.add_argument("--year",        required=True)
-parser.add_argument("--aoi",         required=True)
-parser.add_argument("--epochs",      type=int,   default=40,   help="Max training epochs (default: 40)")
-parser.add_argument("--batch",       type=int,   default=8,    help="Batch size (default: 8)")
-parser.add_argument("--lr",          type=float, default=1e-4, help="Learning rate (default: 1e-4)")
-parser.add_argument("--val_split",   type=float, default=0.2,  help="Validation split (default: 0.2)")
-parser.add_argument("--patience",    type=int,   default=6,    help="Early stopping patience (default: 6)")
-parser.add_argument("--threshold",   type=float, default=0.35, help="Binarization threshold (default: 0.35)")
-parser.add_argument("--in_channels", type=int,   default=None, help="Input bands. Auto-detected from stack if omitted.")
-parser.add_argument("--pos_weight",  type=float, default=None, help="BCE pos_weight. Auto-computed from masks if omitted.")
-parser.add_argument("--workers",     type=int,   default=0,    help="DataLoader workers (default: 0 for macOS MPS)")
+parser.add_argument("--year",             required=True)
+parser.add_argument("--aoi",              required=True)
+parser.add_argument("--epochs",           type=int,   default=40,   help="Max training epochs (default: 40)")
+parser.add_argument("--batch",            type=int,   default=8,    help="Batch size (default: 8)")
+parser.add_argument("--lr",               type=float, default=1e-4, help="Learning rate (default: 1e-4)")
+parser.add_argument("--val_split",        type=float, default=0.2,  help="Validation split (default: 0.2)")
+parser.add_argument("--patience",         type=int,   default=6,    help="Early stopping patience (default: 6)")
+parser.add_argument("--threshold",        type=float, default=0.35, help="Binarization threshold (default: 0.35)")
+parser.add_argument("--in_channels",      type=int,   default=None, help="Input bands. Auto-detected from stack if omitted.")
+parser.add_argument("--pos_weight",       type=float, default=None, help="BCE pos_weight. Auto-computed from masks if omitted.")
+parser.add_argument("--pos_weight_floor", type=float, default=1.0,  help="Minimum allowed pos_weight (default: 1.0).")
+parser.add_argument("--pretrained_ckpt",  type=str,   default=None, help="Path to pretrained checkpoint for transfer learning.")
+parser.add_argument("--workers",          type=int,   default=0,    help="DataLoader workers (default: 0 for macOS MPS)")
 args = parser.parse_args()
 
 YEAR       = args.year
@@ -55,7 +57,7 @@ LR         = args.lr
 VAL_SPLIT  = args.val_split
 PATIENCE   = args.patience
 THRESHOLD  = args.threshold
-IGNORE_IDX = 255  # mask value to exclude from loss
+IGNORE_IDX = 255
 
 MODEL_DIR  = Path("models")
 MODEL_DIR.mkdir(exist_ok=True)
@@ -122,31 +124,43 @@ val_ds   = Subset(ds_val,   val_idx)
 
 # -----------------------------------------
 # COMPUTE pos_weight FROM TRAINING MASKS
-# Only count pixels with label 0 or 1 (ignore 255)
+#
+# pos_weight = neg_count / pos_count
+#   floored at pos_weight_floor (default 1.0) -- never penalise coconut prediction
+#   capped at 50 to prevent instability
+#   fallback to 3.0 when no positive pixels found
 # -----------------------------------------
+POS_WEIGHT_FLOOR = args.pos_weight_floor
+
 if args.pos_weight is not None:
-    POS_WEIGHT = args.pos_weight
+    POS_WEIGHT = max(args.pos_weight, POS_WEIGHT_FLOOR)
+    print(f"\nUsing manual pos_weight={POS_WEIGHT:.2f}  (floor={POS_WEIGHT_FLOOR})")
 else:
     print("\nComputing pos_weight from training masks...")
     pos_count, neg_count = 0, 0
     for idx in train_idx:
         mask = np.load(mask_dir / f"mask_{idx:06d}.npy").astype(np.float32)
         pos_count += int((mask == 1).sum())
-        neg_count += int((mask == 0).sum())  # only confirmed negatives
+        neg_count += int((mask == 0).sum())
     if pos_count == 0:
-        POS_WEIGHT = 10.0
+        POS_WEIGHT = 3.0
         print(f"   WARNING: No positive pixels found -- using default pos_weight={POS_WEIGHT}")
+    elif neg_count == 0:
+        POS_WEIGHT = POS_WEIGHT_FLOOR
+        print(f"   WARNING: No negative pixels found -- using floor pos_weight={POS_WEIGHT}")
+        print(f"   Background patches = 0. Re-run make_patches.py to fix this.")
     else:
-        POS_WEIGHT = min(neg_count / pos_count, 50.0)
+        raw_weight = neg_count / pos_count
+        POS_WEIGHT = max(min(raw_weight, 50.0), POS_WEIGHT_FLOOR)
         print(f"   pos pixels (coconut)    : {pos_count:,}")
         print(f"   neg pixels (confirmed)  : {neg_count:,}")
-        print(f"   pos_weight              : {POS_WEIGHT:.1f}  (capped at 50)")
+        print(f"   raw neg/pos ratio       : {raw_weight:.3f}")
+        print(f"   pos_weight (floored)    : {POS_WEIGHT:.2f}  (floor={POS_WEIGHT_FLOOR}, cap=50)")
 
 log.info(f"pos_weight={POS_WEIGHT:.2f}")
 
 # -----------------------------------------
 # LOSS FUNCTIONS WITH IGNORE MASK SUPPORT
-# Pixels where mask == 255 are excluded from all loss calculations.
 # -----------------------------------------
 class DiceLoss(nn.Module):
     def __init__(self, smooth=1e-6):
@@ -155,7 +169,6 @@ class DiceLoss(nn.Module):
 
     def forward(self, logits, targets, valid_mask):
         preds   = torch.sigmoid(logits)
-        # Apply valid mask — only compute Dice on labeled pixels
         preds   = preds[valid_mask]
         targets = targets[valid_mask]
         inter   = (preds * targets).sum()
@@ -171,7 +184,6 @@ class FocalLoss(nn.Module):
         self.pos_weight = pos_weight
 
     def forward(self, logits, targets, valid_mask):
-        # Apply valid mask
         logits  = logits[valid_mask]
         targets = targets[valid_mask]
         if logits.numel() == 0:
@@ -188,11 +200,9 @@ dice_loss  = DiceLoss()
 focal_loss = FocalLoss(pos_weight=POS_WEIGHT, gamma=2.0)
 
 def combined_loss(logits, targets_raw):
-    # Build valid mask: only pixels with label 0 or 1
     valid_mask = (targets_raw != IGNORE_IDX)
-    # For loss computation, treat labels as float (0.0 or 1.0)
     targets = targets_raw.float()
-    targets[~valid_mask] = 0.0  # set ignore pixels to 0 (won't affect loss due to mask)
+    targets[~valid_mask] = 0.0
     fl = focal_loss(logits, targets, valid_mask)
     dl = dice_loss(logits, targets, valid_mask)
     return fl + dl
@@ -206,7 +216,6 @@ def compute_metrics(logits, targets_raw, threshold):
     pred_prob  = torch.sigmoid(logits)
     pred_bin   = (pred_prob > threshold).float()
     targets    = targets_raw.float()
-    # Only evaluate on valid (non-ignore) pixels
     pred_bin = pred_bin[valid_mask]
     targets  = targets[valid_mask]
     inter    = (pred_bin * targets).sum()
@@ -239,7 +248,7 @@ if __name__ == "__main__":
     print(f"   Train     : {len(train_ds):,}  (augmentation ON)")
     print(f"   Val       : {len(val_ds):,}  (augmentation OFF)")
     print(f"   Channels  : {IN_CH}")
-    print(f"   pos_weight: {POS_WEIGHT:.1f}")
+    print(f"   pos_weight: {POS_WEIGHT:.2f}")
     print(f"   Ignore    : mask value {IGNORE_IDX} excluded from loss")
     log.info(f"Dataset: total={n}, train={len(train_ds)}, val={len(val_ds)}")
 
@@ -247,6 +256,18 @@ if __name__ == "__main__":
     total_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(f"   Parameters: {total_params:,}")
     log.info(f"Model: UNetTransformer, params={total_params}, in_channels={IN_CH}")
+
+    # Optional: load pretrained checkpoint for district transfer learning
+    if args.pretrained_ckpt is not None:
+        ckpt_path = Path(args.pretrained_ckpt)
+        if ckpt_path.exists():
+            ckpt  = torch.load(ckpt_path, map_location=device)
+            state = ckpt["model_state"] if "model_state" in ckpt else ckpt
+            model.load_state_dict(state, strict=False)
+            print(f"   Loaded pretrained weights from {ckpt_path}")
+            log.info(f"Pretrained weights loaded from {ckpt_path}")
+        else:
+            print(f"   WARNING: pretrained_ckpt not found: {ckpt_path} -- training from scratch")
 
     optimizer = optim.AdamW(model.parameters(), lr=LR, weight_decay=1e-4)
     scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=EPOCHS, eta_min=1e-6)
