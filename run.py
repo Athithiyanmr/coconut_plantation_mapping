@@ -35,8 +35,8 @@ parser.add_argument("--skip_canopy", action="store_true",
                     help="Skip canopy height entirely (builds 11-band stack instead of 12)")
 
 # DL tuning
-parser.add_argument("--patch",     type=int,   default=64)
-parser.add_argument("--stride",    type=int,   default=32)
+parser.add_argument("--patch",     type=int,   default=128)
+parser.add_argument("--stride",    type=int,   default=64)
 parser.add_argument("--threshold", type=float, default=0.35)
 parser.add_argument("--all_touched", action="store_true",
                     help="(Shapefile mode only) Burn pixels touching polygon edges")
