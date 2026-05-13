@@ -1,4 +1,7 @@
 # scripts/dl/train_unet.py
+#
+# Trains UNet-Transformer for coconut plantation segmentation.
+# Supports ignore mask (255) — pixels with label=255 are excluded from loss.
 
 import os
 os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
@@ -52,6 +55,7 @@ LR         = args.lr
 VAL_SPLIT  = args.val_split
 PATIENCE   = args.patience
 THRESHOLD  = args.threshold
+IGNORE_IDX = 255  # mask value to exclude from loss
 
 MODEL_DIR  = Path("models")
 MODEL_DIR.mkdir(exist_ok=True)
@@ -89,8 +93,6 @@ log.info(f"Device: {device}")
 
 # -----------------------------------------
 # DATASET
-# Train split  : augmentation ON
-# Val split    : augmentation OFF  (deterministic evaluation)
 # -----------------------------------------
 img_dir  = Path(f"data/dl/{YEAR}_{AOI}/images")
 mask_dir = Path(f"data/dl/{YEAR}_{AOI}/masks")
@@ -101,7 +103,6 @@ if not img_dir.exists() or not mask_dir.exists():
         "Run make_patches.py first."
     )
 
-# Full dataset with augment=False just for length / splitting
 ds_full = CoconutDataset(img_dir, mask_dir, augment=False)
 n       = len(ds_full)
 if n == 0:
@@ -113,7 +114,6 @@ val_size  = int(n * VAL_SPLIT)
 train_idx = all_idx[val_size:]
 val_idx   = all_idx[:val_size]
 
-# Separate dataset objects so augmentation only applies to train
 ds_train = CoconutDataset(img_dir, mask_dir, augment=True)
 ds_val   = CoconutDataset(img_dir, mask_dir, augment=False)
 
@@ -122,8 +122,7 @@ val_ds   = Subset(ds_val,   val_idx)
 
 # -----------------------------------------
 # COMPUTE pos_weight FROM TRAINING MASKS
-# neg/pos pixel ratio across all training patches.
-# Capped at 50 to avoid loss instability.
+# Only count pixels with label 0 or 1 (ignore 255)
 # -----------------------------------------
 if args.pos_weight is not None:
     POS_WEIGHT = args.pos_weight
@@ -132,34 +131,33 @@ else:
     pos_count, neg_count = 0, 0
     for idx in train_idx:
         mask = np.load(mask_dir / f"mask_{idx:06d}.npy").astype(np.float32)
-        pos_count += int(mask.sum())
-        neg_count += int((mask == 0).sum())
+        pos_count += int((mask == 1).sum())
+        neg_count += int((mask == 0).sum())  # only confirmed negatives
     if pos_count == 0:
         POS_WEIGHT = 10.0
         print(f"   WARNING: No positive pixels found -- using default pos_weight={POS_WEIGHT}")
     else:
         POS_WEIGHT = min(neg_count / pos_count, 50.0)
-        print(f"   pos pixels : {pos_count:,}")
-        print(f"   neg pixels : {neg_count:,}")
-        print(f"   pos_weight : {POS_WEIGHT:.1f}  (capped at 50)")
+        print(f"   pos pixels (coconut)    : {pos_count:,}")
+        print(f"   neg pixels (confirmed)  : {neg_count:,}")
+        print(f"   pos_weight              : {POS_WEIGHT:.1f}  (capped at 50)")
 
 log.info(f"pos_weight={POS_WEIGHT:.2f}")
 
 # -----------------------------------------
-# LOSS FUNCTIONS
-# Model now returns RAW LOGITS (sigmoid removed from forward()).
-# FocalLoss uses binary_cross_entropy_with_logits directly.
-# DiceLoss applies sigmoid internally.
+# LOSS FUNCTIONS WITH IGNORE MASK SUPPORT
+# Pixels where mask == 255 are excluded from all loss calculations.
 # -----------------------------------------
 class DiceLoss(nn.Module):
     def __init__(self, smooth=1e-6):
         super().__init__()
         self.smooth = smooth
 
-    def forward(self, logits, targets):
-        preds   = torch.sigmoid(logits)   # sigmoid here only for Dice
-        preds   = preds.view(-1)
-        targets = targets.view(-1)
+    def forward(self, logits, targets, valid_mask):
+        preds   = torch.sigmoid(logits)
+        # Apply valid mask — only compute Dice on labeled pixels
+        preds   = preds[valid_mask]
+        targets = targets[valid_mask]
         inter   = (preds * targets).sum()
         return 1 - (2 * inter + self.smooth) / (
             preds.sum() + targets.sum() + self.smooth
@@ -167,17 +165,17 @@ class DiceLoss(nn.Module):
 
 
 class FocalLoss(nn.Module):
-    """
-    Focal loss directly on raw logits via BCEWithLogitsLoss.
-    pos_weight penalises missed coconut pixels.
-    gamma focuses on hard examples.
-    """
     def __init__(self, pos_weight: float = 1.0, gamma: float = 2.0):
         super().__init__()
         self.gamma      = gamma
         self.pos_weight = pos_weight
 
-    def forward(self, logits, targets):
+    def forward(self, logits, targets, valid_mask):
+        # Apply valid mask
+        logits  = logits[valid_mask]
+        targets = targets[valid_mask]
+        if logits.numel() == 0:
+            return torch.tensor(0.0, device=logits.device, requires_grad=True)
         pw  = torch.tensor(self.pos_weight, device=logits.device, dtype=logits.dtype)
         bce = nn.functional.binary_cross_entropy_with_logits(
             logits, targets, pos_weight=pw, reduction="none"
@@ -189,19 +187,31 @@ class FocalLoss(nn.Module):
 dice_loss  = DiceLoss()
 focal_loss = FocalLoss(pos_weight=POS_WEIGHT, gamma=2.0)
 
-def combined_loss(logits, targets):
-    return focal_loss(logits, targets) + dice_loss(logits, targets)
+def combined_loss(logits, targets_raw):
+    # Build valid mask: only pixels with label 0 or 1
+    valid_mask = (targets_raw != IGNORE_IDX)
+    # For loss computation, treat labels as float (0.0 or 1.0)
+    targets = targets_raw.float()
+    targets[~valid_mask] = 0.0  # set ignore pixels to 0 (won't affect loss due to mask)
+    fl = focal_loss(logits, targets, valid_mask)
+    dl = dice_loss(logits, targets, valid_mask)
+    return fl + dl
 
 
 # -----------------------------------------
-# METRICS  (operate on sigmoid probabilities)
+# METRICS (only on labeled pixels)
 # -----------------------------------------
-def compute_metrics(logits, targets, threshold):
-    pred_prob = torch.sigmoid(logits)
-    pred_bin  = (pred_prob > threshold).float()
-    inter     = (pred_bin * targets).sum()
-    union     = pred_bin.sum() + targets.sum() - inter
-    iou       = (inter / (union + 1e-6)).item()
+def compute_metrics(logits, targets_raw, threshold):
+    valid_mask = (targets_raw != IGNORE_IDX)
+    pred_prob  = torch.sigmoid(logits)
+    pred_bin   = (pred_prob > threshold).float()
+    targets    = targets_raw.float()
+    # Only evaluate on valid (non-ignore) pixels
+    pred_bin = pred_bin[valid_mask]
+    targets  = targets[valid_mask]
+    inter    = (pred_bin * targets).sum()
+    union    = pred_bin.sum() + targets.sum() - inter
+    iou      = (inter / (union + 1e-6)).item()
     tp = (pred_bin * targets).sum().item()
     fp = (pred_bin * (1 - targets)).sum().item()
     fn = ((1 - pred_bin) * targets).sum().item()
@@ -230,15 +240,14 @@ if __name__ == "__main__":
     print(f"   Val       : {len(val_ds):,}  (augmentation OFF)")
     print(f"   Channels  : {IN_CH}")
     print(f"   pos_weight: {POS_WEIGHT:.1f}")
+    print(f"   Ignore    : mask value {IGNORE_IDX} excluded from loss")
     log.info(f"Dataset: total={n}, train={len(train_ds)}, val={len(val_ds)}")
 
-    # MODEL
     model = UNetTransformer(in_channels=IN_CH).to(device)
     total_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(f"   Parameters: {total_params:,}")
     log.info(f"Model: UNetTransformer, params={total_params}, in_channels={IN_CH}")
 
-    # OPTIMISER + SCHEDULER
     optimizer = optim.AdamW(model.parameters(), lr=LR, weight_decay=1e-4)
     scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=EPOCHS, eta_min=1e-6)
 
@@ -256,7 +265,7 @@ if __name__ == "__main__":
         model.train()
         train_loss = 0.0
         for x, y in tqdm(train_dl, desc=f"Epoch {epoch:02d}/{EPOCHS} [Train]", leave=False):
-            x, y = x.to(device), y.float().to(device)
+            x, y = x.to(device), y.to(device)
             optimizer.zero_grad()
             logits = model(x)
             loss   = combined_loss(logits, y)
@@ -273,7 +282,7 @@ if __name__ == "__main__":
         total_f1  = 0.0
         with torch.no_grad():
             for x, y in val_dl:
-                x, y   = x.to(device), y.float().to(device)
+                x, y   = x.to(device), y.to(device)
                 logits  = model(x)
                 loss    = combined_loss(logits, y)
                 val_loss += loss.item()
