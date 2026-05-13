@@ -7,43 +7,51 @@ from pathlib import Path
 # --------------------------------
 # ARGUMENTS
 # --------------------------------
-parser = argparse.ArgumentParser()
+parser = argparse.ArgumentParser(
+    description="End-to-end coconut plantation mapping pipeline"
+)
 
-parser.add_argument("--year",  required=True)
-parser.add_argument("--aoi",   required=True)
+# Core
+parser.add_argument("--year",  required=True,  help="Sentinel-2 year (e.g. 2025)")
+parser.add_argument("--aoi",   required=True,  help="AOI name matching your shapefile stem (e.g. villupuram)")
 
-# Coconut label source:
-#   Pass a .shp file  -> rasterize manually digitized polygons
-#   Pass a directory  -> use Descals et al. (2023) tiles
+# Label source
 parser.add_argument("--label_dir", default=None,
                     help="Coconut label source: path to a .shp file (manual polygons) "
                          "or a directory containing Descals GeoTIFF tiles")
 
-# WRI / Meta canopy height
-# Three modes:
-#   1. --canopy_tiles_dir  -> you have the raw tiles locally; script selects + clips them
-#   2. --canopy_height     -> you already have the final clipped .tif ready
-#   3. --skip_canopy       -> skip entirely (11-band stack)
+# Canopy height
 parser.add_argument("--canopy_tiles_dir", default=None,
-                    help="Path to your local folder of WRI/Meta canopy height .tif tiles. "
-                         "The pipeline will auto-select tiles intersecting the AOI, "
-                         "merge them, clip to AOI and save to data/raw/canopy_height/{aoi}.tif")
+                    help="Path to local WRI/Meta canopy height tiles folder. "
+                         "Auto-selects + clips tiles intersecting the AOI.")
 parser.add_argument("--canopy_height", default=None,
-                    help="Path to an already-clipped canopy height .tif for the AOI. "
-                         "Use this if you've already run the canopy step before.")
+                    help="Path to an already-clipped canopy height .tif for the AOI.")
 parser.add_argument("--skip_canopy", action="store_true",
-                    help="Skip canopy height entirely (builds 11-band stack instead of 12)")
+                    help="Skip canopy height (builds 11-band stack instead of 12)")
 
-# DL tuning
-parser.add_argument("--patch",     type=int,   default=128)
-parser.add_argument("--stride",    type=int,   default=64)
-parser.add_argument("--threshold", type=float, default=0.35)
-parser.add_argument("--all_touched", action="store_true",
-                    help="(Shapefile mode only) Burn pixels touching polygon edges")
+# ---- make_patches defaults ----
+parser.add_argument("--patch",         type=int,   default=128,  help="Patch size in pixels (default: 128)")
+parser.add_argument("--stride",        type=int,   default=32,   help="Stride between patches (default: 32)")
+parser.add_argument("--pos_ratio",     type=float, default=0.005,help="Min coconut fraction to keep positive patch (default: 0.005)")
+parser.add_argument("--neg_sample",    type=float, default=0.50, help="Background patch keep probability (default: 0.50)")
+parser.add_argument("--neg_min_ratio", type=float, default=0.01, help="Min gt==0 fraction required for background patch (default: 0.01)")
+parser.add_argument("--nodata_tol",    type=float, default=0.40, help="Max NaN fraction in a patch (default: 0.40)")
+parser.add_argument("--ignore_tol",    type=float, default=0.95, help="Skip patch if >X fraction is ignore/255 (default: 0.95)")
+parser.add_argument("--dilate",        type=int,   default=2,    help="Coconut mask dilation iterations (default: 2)")
 
-# optional skip flags
-parser.add_argument("--skip_download", action="store_true")
-parser.add_argument("--skip_train",    action="store_true")
+# ---- train_unet defaults ----
+parser.add_argument("--epochs",           type=int,   default=60,   help="Max training epochs (default: 60)")
+parser.add_argument("--batch",            type=int,   default=8,    help="Batch size (default: 8)")
+parser.add_argument("--lr",               type=float, default=1e-4, help="Learning rate (default: 1e-4)")
+parser.add_argument("--patience",         type=int,   default=10,   help="Early stopping patience (default: 10)")
+parser.add_argument("--threshold",        type=float, default=0.35, help="Prediction binarization threshold (default: 0.35)")
+parser.add_argument("--pos_weight_floor", type=float, default=1.0,  help="Minimum pos_weight for BCE loss (default: 1.0)")
+parser.add_argument("--pretrained_ckpt",  type=str,   default=None, help="Pretrained model checkpoint for transfer learning")
+
+# Optional skip flags
+parser.add_argument("--all_touched",   action="store_true", help="(Shapefile mode) Burn pixels touching polygon edges")
+parser.add_argument("--skip_download", action="store_true", help="Skip Sentinel-2 download step")
+parser.add_argument("--skip_train",    action="store_true", help="Skip model training step")
 
 args = parser.parse_args()
 
@@ -54,10 +62,8 @@ PATCH     = args.patch
 STRIDE    = args.stride
 THRESHOLD = args.threshold
 
-# Resolve final canopy height .tif path
-# Priority: --skip_canopy > --canopy_height (explicit) > auto path (from tiles or cached)
+# Resolve canopy height path
 AUTO_CANOPY_PATH = Path(f"data/raw/canopy_height/{AOI}.tif")
-
 if args.skip_canopy:
     CANOPY_HEIGHT = None
 elif args.canopy_height:
@@ -95,11 +101,11 @@ def is_shapefile(path):
 run('find . -name "._*" -type f -delete')
 
 
-# --------------------------------
+# ================================
 # PIPELINE
-# --------------------------------
+# ================================
 
-# STEP 1 — Download Sentinel-2
+# STEP 1 -- Download Sentinel-2
 print("\nSTEP 1/8  --  Download Sentinel-2")
 if not args.skip_download:
     run(f"python scripts/00_download_sentinel2_best_per_year.py --year {YEAR} --aoi {AOI}")
@@ -108,14 +114,14 @@ else:
 
 run('find . -name "._*" -type f -delete')
 
-# STEP 2 — Canopy height
+
+# STEP 2 -- Canopy Height
 print("\nSTEP 2/8  --  Canopy Height")
 if CANOPY_HEIGHT is None:
     print("  [skipped] --skip_canopy was set  ->  will build 11-band stack")
 elif Path(CANOPY_HEIGHT).exists():
     print(f"  [cached]  {CANOPY_HEIGHT} already exists, skipping tile selection")
 else:
-    # Need to build the clipped .tif from raw tiles
     if args.canopy_tiles_dir:
         print(f"  Selecting tiles from: {args.canopy_tiles_dir}")
         run(
@@ -132,25 +138,28 @@ else:
         print("  Continuing without canopy height...")
         CANOPY_HEIGHT = None
 
-# STEP 3 — AOI clip
+
+# STEP 3 -- AOI clip
 print("\nSTEP 3/8  --  Prepare AOI")
 run(f"python scripts/01_prepare_aoi_raw.py --year {YEAR} --aoi {AOI}")
 
 run('find . -name "._*" -type f -delete')
 
-# STEP 4 — Build stack
+
+# STEP 4 -- Build Stack
 print("\nSTEP 4/8  --  Build Stack")
 stack_cmd = f"python scripts/02_build_stack.py --year {YEAR} --aoi {AOI}"
 if CANOPY_HEIGHT and Path(CANOPY_HEIGHT).exists():
     stack_cmd += f" --canopy_height \"{CANOPY_HEIGHT}\""
-    print(f"  12-band stack  (including canopy height: {CANOPY_HEIGHT})")
+    print(f"  12-band stack  (canopy height: {CANOPY_HEIGHT})")
 else:
     print("  11-band stack  (no canopy height)")
 run(stack_cmd)
 
 run('find . -name "._*" -type f -delete')
 
-# STEP 5 — Coconut labels
+
+# STEP 5 -- Coconut Labels
 print("\nSTEP 5/8  --  Coconut Labels")
 if LABEL_DIR:
     if is_shapefile(LABEL_DIR):
@@ -174,32 +183,57 @@ else:
 
 run('find . -name "._*" -type f -delete')
 
-# STEP 6 — Create patches
+
+# STEP 6 -- Create Patches
 print("\nSTEP 6/8  --  Create Patches")
 run(
     f"python -m scripts.dl.make_patches "
     f"--year {YEAR} --aoi {AOI} "
-    f"--patch {PATCH} --stride {STRIDE}"
+    f"--patch {PATCH} "
+    f"--stride {STRIDE} "
+    f"--pos_ratio {args.pos_ratio} "
+    f"--neg_sample {args.neg_sample} "
+    f"--neg_min_ratio {args.neg_min_ratio} "
+    f"--nodata_tol {args.nodata_tol} "
+    f"--ignore_tol {args.ignore_tol} "
+    f"--dilate {args.dilate} "
+    f"--clean"
 )
 run('find data/dl -name "._*" -type f -delete')
 
-# STEP 7 — Train
+
+# STEP 7 -- Train
 print("\nSTEP 7/8  --  Train")
 if not args.skip_train:
-    run(f"python -m scripts.dl.train_unet --year {YEAR} --aoi {AOI}")
+    train_cmd = (
+        f"python -m scripts.dl.train_unet "
+        f"--year {YEAR} --aoi {AOI} "
+        f"--epochs {args.epochs} "
+        f"--batch {args.batch} "
+        f"--lr {args.lr} "
+        f"--patience {args.patience} "
+        f"--threshold {THRESHOLD} "
+        f"--pos_weight_floor {args.pos_weight_floor}"
+    )
+    if args.pretrained_ckpt:
+        train_cmd += f" --pretrained_ckpt \"{args.pretrained_ckpt}\""
+    run(train_cmd)
 else:
     print("  [skipped] --skip_train was set")
 
-# STEP 8 — Predict
+
+# STEP 8 -- Predict
 print("\nSTEP 8/8  --  Predict")
 run(
     f"python -m scripts.dl.predict_unet "
     f"--year {YEAR} --aoi {AOI} "
-    f"--patch {PATCH} --stride {STRIDE} "
+    f"--patch {PATCH} "
+    f"--stride {STRIDE} "
     f"--threshold {THRESHOLD}"
 )
 
-# STEP 9 — Evaluate
+
+# FINAL -- Evaluate
 print("\nFINAL STEP  --  Evaluate")
 run(f"python scripts/evaluate_iou.py --year {YEAR} --aoi {AOI}")
 
