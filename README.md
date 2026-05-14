@@ -18,6 +18,26 @@ This project builds a **reproducible deep learning pipeline** that maps coconut 
 
 ---
 
+## 🌴 Key Results
+
+> **Deployed for Coimbatore district — one of Tamil Nadu's primary coconut-growing regions.**
+
+| Metric | Value |
+|---|---|
+| **Training polygons** | 90,438 polygons across 38 Tamil Nadu districts |
+| **Total area mapped** | 245,569 hectares of coconut plantation |
+| **Image resolution** | 10m (Sentinel-2 Level-2A) |
+| **Imagery source** | Microsoft Planetary Computer STAC API |
+| **Label source** | Descals et al. (2023) global coconut palm layer |
+| **Validation metric** | IoU (Intersection over Union) + F1 Score |
+| **Model architecture** | UNet-Transformer (Focal + Dice loss) |
+
+**Policy impact:** Results contributed to district-level agricultural planning and plantation distribution monitoring for Tamil Nadu state government programs.
+
+**Live verification tool:** Field volunteers can validate model predictions across all 38 districts at [coconut_verification_tool →](https://athithiyanmr.github.io/coconut_verification_tool/)
+
+---
+
 ## Scientific Objective
 
 To learn pixel-level representations of coconut plantation canopy from multi-spectral Sentinel-2 imagery, enriched with vegetation-discriminative spectral indices and optional canopy height, using deep convolutional semantic segmentation.
@@ -146,6 +166,8 @@ F1  = 2×TP / (2×TP + FP + FN)
 | 0.40–0.59 | Moderate |
 | 0.60–0.70 | Strong |
 | > 0.70 | Research-grade |
+
+> **Note:** Log your own training run results in `outputs/evaluation/` — the pipeline writes `iou_summary.csv` after each evaluation step.
 
 ---
 
