@@ -224,10 +224,11 @@ log.info(f"Coverage: {covered:.1f}%%")
 # -----------------------------------------
 # SAVE PROBABILITY MAP
 # -----------------------------------------
+# nodata=255 (unused in float32 prob map, safe sentinel)
 meta.update(
     count=1,
     dtype="float32",
-    nodata=0,
+    nodata=None,          # probability map has no nodata -- every pixel has a real score
     compress="lzw",
     tiled=True,
     blockxsize=256,
@@ -251,6 +252,10 @@ log.info(f"Prob saved: {OUT_PROB}, size={prob_mb:.1f}MB")
 
 # -----------------------------------------
 # BINARY OUTPUT
+# FIX: nodata=255 (not 0) so that not-coconut pixels (value=0)
+#      are properly visible in QGIS and other GIS tools.
+#      Using nodata=0 caused QGIS to treat ALL background pixels
+#      as transparent/empty, making the map look like all-coconut.
 # -----------------------------------------
 if not args.no_binary:
     binary = (pred_final > THRESHOLD).astype("uint8")
@@ -258,7 +263,8 @@ if not args.no_binary:
     total  = H * W
     pct    = 100 * coconut_px / total
 
-    meta.update(dtype="uint8", nodata=0)
+    # nodata=255 -- safe sentinel for uint8 binary (only values are 0 and 1)
+    meta.update(dtype="uint8", nodata=255)
 
     with rasterio.open(OUT_BIN, "w", **meta) as dst:
         dst.write(binary, 1)
@@ -270,6 +276,7 @@ if not args.no_binary:
 
     bin_mb = OUT_BIN.stat().st_size / 1_000_000
     print(f"Binary map       -> {OUT_BIN} ({bin_mb:.1f} MB)")
+    print(f"   0 = not coconut  |  1 = coconut  |  255 = nodata (outside AOI)")
     print(f"   Coconut pixels: {coconut_px:,} / {total:,} ({pct:.2f}%%)")
     log.info(f"Binary saved: {OUT_BIN}, coconut={coconut_px}, pct={pct:.2f}%%")
 
@@ -282,5 +289,6 @@ print(f"   Probability map : {OUT_PROB}")
 if not args.no_binary:
     print(f"   Binary map      : {OUT_BIN}")
     print(f"   Coconut area    : {pct:.2f}%% of AOI")
+    print(f"   Binary classes  : 0=not-coconut  1=coconut  255=nodata")
 print(f"{'='*55}")
 log.info(f"Prediction complete: AOI={AOI}, year={YEAR}")
