@@ -1,10 +1,11 @@
 # scripts/00_prepare_training_dataset.py
 #
-# Prepares final training dataset GeoJSON from a verified coconut polygon file.
+# Prepares final training dataset from a verified coconut polygon GeoJSON.
 # - Cleans verification_status ('pending' -> 'yes')
 # - Maps class: yes -> 1 (coconut), no -> 0 (not-coconut)
 # - Clips to district AOI boundary
-# - Saves to data/raw/training/<aoi>.geojson and data/raw/boundaries/<aoi>.shp
+# - Saves labels as BOTH .shp and .geojson
+# - Saves AOI boundary as .shp for pipeline
 #
 # Usage:
 #   python scripts/00_prepare_training_dataset.py \
@@ -13,8 +14,9 @@
 #       --name     dindigul
 #
 # Output:
-#   data/raw/training/<name>_verified_final.geojson   <- labeled training polygons
-#   data/raw/boundaries/<name>.shp                    <- AOI boundary for pipeline
+#   data/raw/training/<name>_verified_final.shp      <- pipeline uses this (.shp)
+#   data/raw/training/<name>_verified_final.geojson  <- backup / inspection
+#   data/raw/boundaries/<name>.shp                   <- AOI boundary for pipeline
 #
 # Class legend:
 #   1  = confirmed coconut plantation
@@ -41,7 +43,7 @@ log = logging.getLogger(__name__)
 # ARGUMENTS
 # -----------------------------------------
 parser = argparse.ArgumentParser(
-    description="Prepare training dataset GeoJSON with class labels and AOI clip"
+    description="Prepare training dataset with class labels and AOI clip"
 )
 parser.add_argument("--verified", required=True,
                     help="Path to verified coconut GeoJSON (with verification_status column)")
@@ -60,8 +62,10 @@ BOUNDARIES_DIR = Path("data/raw/boundaries")
 TRAINING_DIR.mkdir(parents=True, exist_ok=True)
 BOUNDARIES_DIR.mkdir(parents=True, exist_ok=True)
 
-OUT_LABELS = TRAINING_DIR   / f"{NAME}_verified_final.geojson"
-OUT_AOI    = BOUNDARIES_DIR / f"{NAME}.shp"
+# Both formats saved — pipeline always picks up .shp
+OUT_LABELS_SHP     = TRAINING_DIR   / f"{NAME}_verified_final.shp"
+OUT_LABELS_GEOJSON = TRAINING_DIR   / f"{NAME}_verified_final.geojson"
+OUT_AOI            = BOUNDARIES_DIR / f"{NAME}.shp"
 
 print(f"\n{'='*52}")
 print(f"Training Dataset Preparation")
@@ -84,7 +88,7 @@ for col in required_cols:
             f"Available columns: {data.columns.tolist()}"
         )
 
-# Keep only useful columns (add extras if present)
+# Keep only useful columns
 keep_cols = [c for c in ["area_ha", "district", "verification_status", "geometry"] if c in data.columns]
 data = data[keep_cols]
 
@@ -104,16 +108,13 @@ print("\nMapping verification_status to class labels...")
 before_counts = data["verification_status"].value_counts().to_dict()
 print(f"   Before cleanup : {before_counts}")
 
-# Replace 'pending' with 'yes' — field-verified but not yet updated
 data["verification_status"] = data["verification_status"].replace("pending", "yes")
 
 after_counts = data["verification_status"].value_counts().to_dict()
 print(f"   After cleanup  : {after_counts}")
 
-# Map to binary class
 data["class"] = data["verification_status"].map({"yes": 1, "no": 0})
 
-# Drop any rows with unmapped class (unexpected status values)
 unmapped = data["class"].isna().sum()
 if unmapped > 0:
     unique_statuses = data[data["class"].isna()]["verification_status"].unique()
@@ -136,7 +137,7 @@ if n_neg == 0:
     print("   The model will only see positive samples — consider adding background polygons.")
     log.warning("No negative polygons (class=0) in dataset.")
 
-log.info(f"Class distribution after mapping: class=1: {n_pos}, class=0: {n_neg}")
+log.info(f"Class distribution: class=1={n_pos}, class=0={n_neg}")
 
 # -----------------------------------------
 # STEP 3 -- LOAD AOI BOUNDARY
@@ -147,17 +148,14 @@ aoi = gpd.read_file(AOI_PATH)
 if aoi.crs is None:
     raise ValueError("AOI GeoJSON has no CRS. Set it to EPSG:4326 before using.")
 
-# Dissolve to single polygon in case of multiple features
 if len(aoi) > 1:
     print(f"   AOI has {len(aoi)} features — dissolving to single polygon...")
     aoi = aoi.dissolve().reset_index(drop=True)
-    log.info(f"AOI dissolved from {len(aoi)} features to 1")
+    log.info(f"AOI dissolved to 1 polygon")
 
-print(f"   AOI features : {len(aoi)}")
-print(f"   AOI CRS      : {aoi.crs}")
-print(f"   AOI bounds   : {[round(v, 4) for v in aoi.total_bounds]}")
+print(f"   AOI CRS    : {aoi.crs}")
+print(f"   AOI bounds : {[round(v, 4) for v in aoi.total_bounds]}")
 
-# Reproject AOI to match data CRS for clipping
 aoi_reproj = aoi.to_crs(data.crs)
 
 # -----------------------------------------
@@ -181,28 +179,36 @@ print(f"   class=0 : {int((data_clipped['class'] == 0).sum())}")
 if data_clipped.empty:
     raise RuntimeError(
         "No polygons remain after clipping to AOI.\n"
-        "Check that your verified GeoJSON and AOI are for the same area."
+        "Check that your verified GeoJSON and AOI cover the same area."
     )
 
-# Tag the district name
 data_clipped["district_name"] = NAME
 data_clipped.reset_index(drop=True, inplace=True)
 
 # -----------------------------------------
 # STEP 5 -- SAVE OUTPUTS
+# Both .shp (pipeline) and .geojson (inspection) saved
 # -----------------------------------------
 print(f"\nSaving outputs...")
 
-# Save training labels
-data_clipped.to_file(OUT_LABELS, driver="GeoJSON")
-size_labels = OUT_LABELS.stat().st_size / 1000
-print(f"   Labels saved  -> {OUT_LABELS}  ({size_labels:.1f} KB)")
-log.info(f"Labels saved: {OUT_LABELS}")
+# --- Save as Shapefile (primary — pipeline uses this) ---
+data_clipped.to_file(OUT_LABELS_SHP)
+shp_files = list(TRAINING_DIR.glob(f"{NAME}_verified_final.*"))
+print(f"   Labels .shp saved -> {OUT_LABELS_SHP}")
+for f in shp_files:
+    print(f"      {f.name}")
+log.info(f"Labels SHP saved: {OUT_LABELS_SHP}")
 
-# Save AOI as shapefile for pipeline compatibility (01_prepare_aoi_raw.py expects .shp)
+# --- Save as GeoJSON (backup / visual inspection in QGIS) ---
+data_clipped.to_file(OUT_LABELS_GEOJSON, driver="GeoJSON")
+size_geojson = OUT_LABELS_GEOJSON.stat().st_size / 1000
+print(f"   Labels .geojson   -> {OUT_LABELS_GEOJSON}  ({size_geojson:.1f} KB)")
+log.info(f"Labels GeoJSON saved: {OUT_LABELS_GEOJSON}")
+
+# --- Save AOI as shapefile for pipeline (01_prepare_aoi_raw.py expects .shp) ---
 aoi_save = aoi.to_crs(data.crs)
 aoi_save.to_file(OUT_AOI)
-print(f"   AOI saved     -> {OUT_AOI}")
+print(f"   AOI .shp saved    -> {OUT_AOI}")
 log.info(f"AOI saved: {OUT_AOI}")
 
 # -----------------------------------------
@@ -213,14 +219,9 @@ print(f"Dataset preparation complete for: {NAME}")
 print(f"   Total polygons  : {after_clip}")
 print(f"   Coconut  (1)    : {int((data_clipped['class']==1).sum())}")
 print(f"   Not-coco (0)    : {int((data_clipped['class']==0).sum())}")
-print(f"\nNext steps:")
-print(f"  1. Download Sentinel-2 imagery:")
-print(f"       python scripts/00_download_sentinel2_best_per_year.py --aoi {NAME} --year 2024")
-print(f"  2. Preprocess & clip to AOI:")
-print(f"       python scripts/01_prepare_aoi_raw.py --aoi {NAME} --year 2024")
-print(f"  3. Build raster stack:")
-print(f"       python scripts/02_build_stack.py --aoi {NAME} --year 2024")
-print(f"  4. Rasterize training labels:")
-print(f"       python scripts/03_rasterize_manual_labels.py --aoi {NAME} --year 2024 \\")
-print(f"           --shp data/raw/training/{NAME}_verified_final.geojson")
+print(f"\n   Pipeline label file (use this in run.py):")
+print(f"   --label_dir {OUT_LABELS_SHP}")
+print(f"\nNext — full pipeline:")
+print(f"   python run.py --aoi {NAME} --year 2025 --skip_canopy \\")
+print(f"       --label_dir {OUT_LABELS_SHP}")
 print(f"{'='*52}")
