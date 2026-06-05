@@ -13,20 +13,18 @@ parser = argparse.ArgumentParser(
 
 # Core
 parser.add_argument("--year",  required=True,  help="Sentinel-2 year (e.g. 2025)")
-parser.add_argument("--aoi",   required=True,  help="AOI name matching your shapefile stem (e.g. dindigul)")
+parser.add_argument("--aoi",   required=True,  help="District name (e.g. dindigul, villupuram)")
 
-# Label source — accepts .shp, .geojson, or Descals directory
-parser.add_argument("--label_dir", default=None,
-                    help="Coconut label source: path to a .shp/.geojson file (manual polygons) "
-                         "or a directory containing Descals GeoTIFF tiles")
-
-# Dataset prep inputs (used only when --label_dir is a raw unprocessed GeoJSON)
+# Dataset prep — just provide the raw verified GeoJSON
+# Boundary is auto-resolved from data/raw/boundaries/<aoi>.geojson or .shp
 parser.add_argument("--verified_geojson", default=None,
-                    help="Path to raw verified coconut GeoJSON (e.g. dindigul_verified.geojson). "
-                         "If provided, runs STEP 0 to prep labels + AOI before the pipeline.")
-parser.add_argument("--aoi_geojson", default=None,
-                    help="Path to district boundary GeoJSON for STEP 0. "
-                         "If not provided, auto-looked up at data/raw/boundaries/<aoi>.geojson")
+                    help="Path to raw verified coconut GeoJSON (e.g. /path/to/dindigul_verified.geojson). "
+                         "Boundary auto-resolved from data/raw/boundaries/<aoi>.geojson")
+
+# Label source (optional override — normally auto-set after STEP 0)
+parser.add_argument("--label_dir", default=None,
+                    help="Override label path: .shp/.geojson (manual polygons) or directory (Descals tiles). "
+                         "Not needed if --verified_geojson is provided.")
 
 # Canopy height
 parser.add_argument("--canopy_tiles_dir", default=None,
@@ -70,18 +68,20 @@ STRIDE    = args.stride
 THRESHOLD = args.threshold
 
 # --------------------------------
-# Resolve label path
-# After STEP 0, the pipeline always uses the .shp output
+# Standard paths — all derived from --aoi name
 # --------------------------------
 PREP_OUT_SHP     = Path(f"data/raw/training/{AOI}_verified_final.shp")
 PREP_OUT_GEOJSON = Path(f"data/raw/training/{AOI}_verified_final.geojson")
-AOI_SHP          = Path(f"data/raw/boundaries/{AOI}.shp")
+BOUNDARY_GEOJSON = Path(f"data/raw/boundaries/{AOI}.geojson")
+BOUNDARY_SHP     = Path(f"data/raw/boundaries/{AOI}.shp")
 
 # Determine effective label path for STEP 5
 if args.label_dir:
     LABEL_DIR = args.label_dir
 elif PREP_OUT_SHP.exists():
     LABEL_DIR = str(PREP_OUT_SHP)
+elif PREP_OUT_GEOJSON.exists():
+    LABEL_DIR = str(PREP_OUT_GEOJSON)
 else:
     LABEL_DIR = None
 
@@ -113,8 +113,8 @@ def run(cmd):
 
 # --------------------------------
 # Detect label mode
-# .shp or .geojson  -> manual rasterize mode
-# directory         -> Descals tile mode
+# .shp or .geojson -> manual rasterize mode
+# directory        -> Descals tile mode
 # --------------------------------
 def is_manual_labels(path):
     if path is None:
@@ -133,40 +133,41 @@ run('find . -name "._*" -type f -delete')
 # PIPELINE
 # ================================
 
-# STEP 0 -- Dataset Preparation (NEW)
-# Runs when --verified_geojson is provided OR when prep output doesn't exist yet
+# STEP 0 -- Dataset Preparation
+# Boundary auto-resolved from --aoi:
+#   data/raw/boundaries/<aoi>.geojson  (preferred)
+#   data/raw/boundaries/<aoi>.shp      (fallback)
+# No separate --aoi_geojson flag needed.
 print("\nSTEP 0/8  --  Dataset Preparation")
 
 if args.skip_prep:
     print("  [skipped] --skip_prep was set")
 
 elif args.verified_geojson:
-    # User explicitly provided raw verified GeoJSON — run prep
     verified_path = args.verified_geojson
 
-    # Resolve AOI boundary: use --aoi_geojson if given, else look for default locations
-    if args.aoi_geojson:
-        aoi_boundary = args.aoi_geojson
-    elif Path(f"data/raw/boundaries/{AOI}.geojson").exists():
-        aoi_boundary = f"data/raw/boundaries/{AOI}.geojson"
-    elif AOI_SHP.exists():
-        aoi_boundary = str(AOI_SHP)
+    # Auto-resolve boundary from --aoi name
+    if BOUNDARY_GEOJSON.exists():
+        aoi_boundary = str(BOUNDARY_GEOJSON)
+    elif BOUNDARY_SHP.exists():
+        aoi_boundary = str(BOUNDARY_SHP)
     else:
         raise FileNotFoundError(
-            f"District boundary not found for AOI '{AOI}'.\n"
-            f"Provide it via --aoi_geojson /path/to/{AOI}_boundary.geojson\n"
-            f"or place it at data/raw/boundaries/{AOI}.geojson"
+            f"\nDistrict boundary not found for '{AOI}'.\n"
+            f"Place your boundary file at one of:\n"
+            f"  data/raw/boundaries/{AOI}.geojson  (preferred)\n"
+            f"  data/raw/boundaries/{AOI}.shp\n"
+            f"Then re-run."
         )
 
     print(f"  Verified GeoJSON : {verified_path}")
-    print(f"  AOI boundary     : {aoi_boundary}")
+    print(f"  AOI boundary     : {aoi_boundary}  (auto-resolved from --aoi {AOI})")
     run(
         f"python scripts/00_prepare_training_dataset.py "
         f"--verified \"{verified_path}\" "
         f"--aoi \"{aoi_boundary}\" "
         f"--name {AOI}"
     )
-    # After prep, always use the .shp output for STEP 5
     LABEL_DIR = str(PREP_OUT_SHP)
     print(f"  Labels ready     : {LABEL_DIR}")
 
@@ -175,16 +176,13 @@ elif PREP_OUT_SHP.exists():
     LABEL_DIR = str(PREP_OUT_SHP)
 
 elif PREP_OUT_GEOJSON.exists():
-    # GeoJSON prep output exists but no .shp yet — still fine, rasterize accepts geojson
     print(f"  [cached] {PREP_OUT_GEOJSON} found — using for labels")
     LABEL_DIR = str(PREP_OUT_GEOJSON)
 
 else:
     print(f"  WARNING: No --verified_geojson provided and no prepared labels found.")
-    print(f"  Expected: {PREP_OUT_SHP}")
-    print(f"  Provide --verified_geojson /path/to/{AOI}_verified.geojson to auto-prepare.")
-    print(f"  Continuing — labels must exist at:")
-    print(f"  data/processed/training/labels_coconut_{YEAR}_{AOI}.tif")
+    print(f"  Place boundary at data/raw/boundaries/{AOI}.geojson then run with:")
+    print(f"  --verified_geojson /path/to/{AOI}_verified.geojson")
 
 run('find . -name "._*" -type f -delete')
 
