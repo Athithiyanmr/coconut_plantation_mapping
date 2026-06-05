@@ -13,17 +13,24 @@ parser = argparse.ArgumentParser(
 
 # Core
 parser.add_argument("--year",  required=True,  help="Sentinel-2 year (e.g. 2025)")
-parser.add_argument("--aoi",   required=True,  help="AOI name matching your shapefile stem (e.g. villupuram)")
+parser.add_argument("--aoi",   required=True,  help="AOI name matching your shapefile stem (e.g. dindigul)")
 
-# Label source
+# Label source — accepts .shp, .geojson, or Descals directory
 parser.add_argument("--label_dir", default=None,
-                    help="Coconut label source: path to a .shp file (manual polygons) "
+                    help="Coconut label source: path to a .shp/.geojson file (manual polygons) "
                          "or a directory containing Descals GeoTIFF tiles")
+
+# Dataset prep inputs (used only when --label_dir is a raw unprocessed GeoJSON)
+parser.add_argument("--verified_geojson", default=None,
+                    help="Path to raw verified coconut GeoJSON (e.g. dindigul_verified.geojson). "
+                         "If provided, runs STEP 0 to prep labels + AOI before the pipeline.")
+parser.add_argument("--aoi_geojson", default=None,
+                    help="Path to district boundary GeoJSON for STEP 0. "
+                         "If not provided, auto-looked up at data/raw/boundaries/<aoi>.geojson")
 
 # Canopy height
 parser.add_argument("--canopy_tiles_dir", default=None,
-                    help="Path to local WRI/Meta canopy height tiles folder. "
-                         "Auto-selects + clips tiles intersecting the AOI.")
+                    help="Path to local WRI/Meta canopy height tiles folder.")
 parser.add_argument("--canopy_height", default=None,
                     help="Path to an already-clipped canopy height .tif for the AOI.")
 parser.add_argument("--skip_canopy", action="store_true",
@@ -52,15 +59,31 @@ parser.add_argument("--pretrained_ckpt",  type=str,   default=None, help="Pretra
 parser.add_argument("--all_touched",   action="store_true", help="(Shapefile mode) Burn pixels touching polygon edges")
 parser.add_argument("--skip_download", action="store_true", help="Skip Sentinel-2 download step")
 parser.add_argument("--skip_train",    action="store_true", help="Skip model training step")
+parser.add_argument("--skip_prep",     action="store_true", help="Skip STEP 0 dataset prep (use if already prepared)")
 
 args = parser.parse_args()
 
 YEAR      = args.year
 AOI       = args.aoi
-LABEL_DIR = args.label_dir
 PATCH     = args.patch
 STRIDE    = args.stride
 THRESHOLD = args.threshold
+
+# --------------------------------
+# Resolve label path
+# After STEP 0, the pipeline always uses the .shp output
+# --------------------------------
+PREP_OUT_SHP     = Path(f"data/raw/training/{AOI}_verified_final.shp")
+PREP_OUT_GEOJSON = Path(f"data/raw/training/{AOI}_verified_final.geojson")
+AOI_SHP          = Path(f"data/raw/boundaries/{AOI}.shp")
+
+# Determine effective label path for STEP 5
+if args.label_dir:
+    LABEL_DIR = args.label_dir
+elif PREP_OUT_SHP.exists():
+    LABEL_DIR = str(PREP_OUT_SHP)
+else:
+    LABEL_DIR = None
 
 # Resolve canopy height path
 AUTO_CANOPY_PATH = Path(f"data/raw/canopy_height/{AOI}.tif")
@@ -90,9 +113,14 @@ def run(cmd):
 
 # --------------------------------
 # Detect label mode
+# .shp or .geojson  -> manual rasterize mode
+# directory         -> Descals tile mode
 # --------------------------------
-def is_shapefile(path):
-    return path is not None and str(path).lower().endswith(".shp")
+def is_manual_labels(path):
+    if path is None:
+        return False
+    p = str(path).lower()
+    return p.endswith(".shp") or p.endswith(".geojson")
 
 
 # --------------------------------
@@ -104,6 +132,62 @@ run('find . -name "._*" -type f -delete')
 # ================================
 # PIPELINE
 # ================================
+
+# STEP 0 -- Dataset Preparation (NEW)
+# Runs when --verified_geojson is provided OR when prep output doesn't exist yet
+print("\nSTEP 0/8  --  Dataset Preparation")
+
+if args.skip_prep:
+    print("  [skipped] --skip_prep was set")
+
+elif args.verified_geojson:
+    # User explicitly provided raw verified GeoJSON — run prep
+    verified_path = args.verified_geojson
+
+    # Resolve AOI boundary: use --aoi_geojson if given, else look for default locations
+    if args.aoi_geojson:
+        aoi_boundary = args.aoi_geojson
+    elif Path(f"data/raw/boundaries/{AOI}.geojson").exists():
+        aoi_boundary = f"data/raw/boundaries/{AOI}.geojson"
+    elif AOI_SHP.exists():
+        aoi_boundary = str(AOI_SHP)
+    else:
+        raise FileNotFoundError(
+            f"District boundary not found for AOI '{AOI}'.\n"
+            f"Provide it via --aoi_geojson /path/to/{AOI}_boundary.geojson\n"
+            f"or place it at data/raw/boundaries/{AOI}.geojson"
+        )
+
+    print(f"  Verified GeoJSON : {verified_path}")
+    print(f"  AOI boundary     : {aoi_boundary}")
+    run(
+        f"python scripts/00_prepare_training_dataset.py "
+        f"--verified \"{verified_path}\" "
+        f"--aoi \"{aoi_boundary}\" "
+        f"--name {AOI}"
+    )
+    # After prep, always use the .shp output for STEP 5
+    LABEL_DIR = str(PREP_OUT_SHP)
+    print(f"  Labels ready     : {LABEL_DIR}")
+
+elif PREP_OUT_SHP.exists():
+    print(f"  [cached] {PREP_OUT_SHP} already exists — skipping prep")
+    LABEL_DIR = str(PREP_OUT_SHP)
+
+elif PREP_OUT_GEOJSON.exists():
+    # GeoJSON prep output exists but no .shp yet — still fine, rasterize accepts geojson
+    print(f"  [cached] {PREP_OUT_GEOJSON} found — using for labels")
+    LABEL_DIR = str(PREP_OUT_GEOJSON)
+
+else:
+    print(f"  WARNING: No --verified_geojson provided and no prepared labels found.")
+    print(f"  Expected: {PREP_OUT_SHP}")
+    print(f"  Provide --verified_geojson /path/to/{AOI}_verified.geojson to auto-prepare.")
+    print(f"  Continuing — labels must exist at:")
+    print(f"  data/processed/training/labels_coconut_{YEAR}_{AOI}.tif")
+
+run('find . -name "._*" -type f -delete')
+
 
 # STEP 1 -- Download Sentinel-2
 print("\nSTEP 1/8  --  Download Sentinel-2")
@@ -162,8 +246,8 @@ run('find . -name "._*" -type f -delete')
 # STEP 5 -- Coconut Labels
 print("\nSTEP 5/8  --  Coconut Labels")
 if LABEL_DIR:
-    if is_shapefile(LABEL_DIR):
-        print("  [Label mode] Shapefile -> rasterizing manual polygons")
+    if is_manual_labels(LABEL_DIR):
+        print(f"  [Label mode] Manual polygons -> rasterizing  ({LABEL_DIR})")
         all_touched_flag = "--all_touched" if args.all_touched else ""
         run(
             f"python scripts/03_rasterize_manual_labels.py "
@@ -177,7 +261,7 @@ if LABEL_DIR:
             f"--year {YEAR} --aoi {AOI} --label_dir \"{LABEL_DIR}\""
         )
 else:
-    print("  [Label mode] --label_dir not provided -- skipping label step")
+    print("  [Label mode] No labels found -- skipping label step")
     print(f"               Labels must exist at:")
     print(f"               data/processed/training/labels_coconut_{YEAR}_{AOI}.tif")
 
