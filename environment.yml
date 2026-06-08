@@ -1,7 +1,8 @@
 name: coconut_mapping
 channels:
-  - conda-forge
   - pytorch
+  - nvidia
+  - conda-forge
   - defaults
 dependencies:
   # --- Python ---
@@ -12,7 +13,7 @@ dependencies:
   - scipy
   - pandas
   - scikit-learn
-  - scikit-image        # skimage — used by rasterio/torchvision deps on Windows
+  - scikit-image        # skimage — required on Windows (rasterio/torchvision dep chain)
 
   # --- Geospatial ---
   - rasterio
@@ -27,9 +28,10 @@ dependencies:
   - tqdm
 
   # --- Deep Learning ---
+  # pytorch-cuda=12.4 is the latest stable build; works fine on CUDA 13.x drivers
   - pytorch
   - torchvision
-  - cpuonly             # remove this line if you have a CUDA GPU
+  - pytorch-cuda=12.4
 
   # --- Utilities ---
   - pip
