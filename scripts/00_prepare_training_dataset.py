@@ -28,6 +28,7 @@ import logging
 from pathlib import Path
 
 import geopandas as gpd
+from shapely.validation import make_valid
 
 # -----------------------------------------
 # LOGGING
@@ -157,6 +158,29 @@ print(f"   AOI CRS    : {aoi.crs}")
 print(f"   AOI bounds : {[round(v, 4) for v in aoi.total_bounds]}")
 
 aoi_reproj = aoi.to_crs(data.crs)
+
+# -----------------------------------------
+# GEOMETRY REPAIR — fix invalid geometries
+# in both layers before clipping to avoid
+# TopologyException (side location conflict)
+# -----------------------------------------
+print("\nRepairing geometries (make_valid)...")
+
+before_data = len(data)
+data = data.copy()
+data["geometry"] = data.geometry.apply(make_valid)
+data = data[~data.geometry.is_empty & data.geometry.notna()]
+after_data = len(data)
+if before_data != after_data:
+    print(f"   Dropped {before_data - after_data} empty/null geometries from verified data")
+    log.warning(f"make_valid dropped {before_data - after_data} empty geometries from verified data")
+
+aoi_reproj = aoi_reproj.copy()
+aoi_reproj["geometry"] = aoi_reproj.geometry.apply(make_valid)
+aoi_reproj = aoi_reproj[~aoi_reproj.geometry.is_empty & aoi_reproj.geometry.notna()]
+
+print("   Geometry repair complete.")
+log.info("make_valid applied to both data and aoi_reproj layers")
 
 # -----------------------------------------
 # STEP 4 -- CLIP LABELS TO AOI
