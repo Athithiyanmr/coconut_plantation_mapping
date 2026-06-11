@@ -41,14 +41,26 @@ OUT.mkdir(parents=True, exist_ok=True)
 # SCL included for cloud masking in 01_prepare_aoi_raw.py
 BANDS = ["B02", "B03", "B04", "B05", "B06", "B08", "B11", "B12", "SCL"]
 
+# Minimum file size per band (bytes)
+# SCL is a 20m resolution single-band uint8 -- smaller than spectral bands
+# Spectral bands are 10m or 20m float32 -- larger files
+MIN_SIZE = {
+    "SCL": 100_000,       # 100 KB minimum for SCL (20m, uint8)
+    "default": 1_000_000, # 1 MB minimum for spectral bands
+}
+
 # -----------------------------------------
 # SAFE DOWNLOAD
+# Increased timeout to 300s and retries to 5
+# for slow / unstable connections (Windows)
 # -----------------------------------------
-@retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=2, min=4, max=30))
+@retry(stop=stop_after_attempt(5), wait=wait_exponential(multiplier=2, min=5, max=60))
 def download(url, out_path):
     tmp = out_path.with_suffix(".tmp")
+    band_name = out_path.stem  # e.g. 'SCL', 'B02'
+    min_bytes = MIN_SIZE.get(band_name, MIN_SIZE["default"])
     try:
-        with requests.get(url, stream=True, timeout=120) as r:
+        with requests.get(url, stream=True, timeout=300) as r:
             r.raise_for_status()
             total = int(r.headers.get("content-length", 0))
             with open(tmp, "wb") as f, tqdm(
@@ -63,9 +75,13 @@ def download(url, out_path):
                         f.write(chunk)
                         bar.update(len(chunk))
 
-        if tmp.stat().st_size < 1_000_000:
+        actual_size = tmp.stat().st_size
+        if actual_size < min_bytes:
             tmp.unlink(missing_ok=True)
-            raise RuntimeError(f"Corrupted download: {out_path.name}")
+            raise RuntimeError(
+                f"Corrupted download: {out_path.name} "
+                f"(got {actual_size:,} bytes, expected >= {min_bytes:,})"
+            )
 
         tmp.rename(out_path)
         log.info(f"Downloaded: {out_path}")
