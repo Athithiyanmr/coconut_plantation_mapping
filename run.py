@@ -58,6 +58,7 @@ parser.add_argument("--all_touched",   action="store_true", help="(Shapefile mod
 parser.add_argument("--skip_download", action="store_true", help="Skip Sentinel-2 download step")
 parser.add_argument("--skip_train",    action="store_true", help="Skip model training step")
 parser.add_argument("--skip_prep",     action="store_true", help="Skip STEP 0 dataset prep (use if already prepared)")
+parser.add_argument("--skip_area",     action="store_true", help="Skip area calculation step")
 
 args = parser.parse_args()
 
@@ -318,6 +319,22 @@ run(
 # FINAL -- Evaluate
 print("\nFINAL STEP  --  Evaluate")
 run(f"python scripts/evaluate_iou.py --year {YEAR} --aoi {AOI}")
+
+
+# AREA -- Calculate coconut plantation area in hectares and acres
+print("\nAREA STEP  --  Coconut Plantation Area")
+if not args.skip_area:
+    BINARY_TIF = Path(f"outputs/unet/{YEAR}/coconut_binary_{YEAR}_{AOI}.tif")
+    if BINARY_TIF.exists():
+        run(
+            f"python scripts/calculate_area.py "
+            f"--year {YEAR} --aoi {AOI}"
+        )
+    else:
+        print(f"  [WARNING] Binary prediction not found: {BINARY_TIF}")
+        print(f"  Area calculation skipped. Re-run predict step or check output path.")
+else:
+    print("  [skipped] --skip_area was set")
 
 
 print("\n" + "="*65)
